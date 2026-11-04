@@ -37,7 +37,7 @@ SYNONYMES = {
              "date de piece", "date doc", "date document", "date comptable", "date de facturation", "date facturation",
              "invoice date", "issue date", "date of issue", "date creation", "date de creation", "created", "date"],
     "numero": ["numero facture", "numero de facture", "n facture", "n de facture", "no facture", "num facture", "n piece",
-               "numero piece", "N°","numero de piece", "n de piece", "reference facture", "ref facture", "invoice number",
+               "numero piece", "n°","numero de piece", "n de piece", "reference facture", "ref facture", "invoice number",
                "invoice no", "invoice", "document", "numero", "reference", "ref", "num", "facture", "piece"],
     "tiers": ["client", "nom client", "nom du client", "raison sociale", "fournisseur", "nom fournisseur",
               "nom du fournisseur", "tiers", "nom tiers", "societe", "entreprise", "denomination", "customer",
