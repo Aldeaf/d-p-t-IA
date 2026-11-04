@@ -1,4 +1,6 @@
 pandas
 openpyxl
+pdfplumber
+pypdf
 anthropic
 streamlit

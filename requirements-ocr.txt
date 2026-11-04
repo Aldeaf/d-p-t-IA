@@ -1,0 +1,3 @@
+# Facultatif, pour les scans (poste local ou serveur, pas l'hébergement gratuit)
+paddlepaddle
+paddleocr
