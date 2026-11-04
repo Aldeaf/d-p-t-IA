@@ -65,15 +65,20 @@ def mapping_regles(colonnes):
             if champ in res: break
     return res
 
+def cle_api():
+    """Clé API valide ou chaîne vide (ignore les valeurs factices comme sk-ant-...)."""
+    cle = os.getenv("ANTHROPIC_API_KEY", "").strip().strip("\"'“”‘’ ")
+    return cle if len(cle) >= 40 and "..." not in cle else ""
+
 def mapping_ia(df, deja):
     """Demande à Claude de deviner les champs manquants (optionnel)."""
     manquants = [c for c in SYNONYMES if c not in deja]
-    if not manquants or not os.getenv("ANTHROPIC_API_KEY"):
+    if not manquants or not cle_api():
         return {}
     try:
         import anthropic
         extrait = df.head(5).to_csv(index=False)
-        rep = anthropic.Anthropic().messages.create(
+        rep = anthropic.Anthropic(api_key=cle_api()).messages.create(
             model="claude-sonnet-4-6", max_tokens=500,
             messages=[{"role": "user", "content":
                 f"Export d'un logiciel de facturation :\n{extrait}\n"
@@ -104,8 +109,8 @@ COLONNES_STD = ["Date facture", "N° facture", "Client", "Total HT", "Taux TVA",
 
 def lire_ia(fichier, type_="vente"):
     """Extrait les factures d'un PDF/image via Claude (payant). Nécessite ANTHROPIC_API_KEY."""
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        raise ValueError("Lecture PDF/image : définissez la variable ANTHROPIC_API_KEY.")
+    if not cle_api():
+        raise ValueError("Lecture IA : aucune clé API valide (elle commence par sk-ant- et fait environ 100 caractères).")
     import anthropic, base64
     ext = os.path.splitext(fichier)[1].lower()
     media = {".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}[ext]
@@ -118,7 +123,7 @@ def lire_ia(fichier, type_="vente"):
                 "Réponds uniquement par un JSON, sans texte autour : "
                 '[{"date":"","numero":"","tiers":"","total_ttc":0.00,'
                 '"lignes":[{"taux_tva":20,"ht":0.00,"tva":0.00}]}]')
-    cle = os.getenv("ANTHROPIC_API_KEY", "").strip().strip("\"'“”‘’ ")
+    cle = cle_api()
     try:
         rep = anthropic.Anthropic(api_key=cle).messages.create(
             model="claude-sonnet-4-6", max_tokens=4000,
@@ -344,10 +349,15 @@ def lire_pdf(fichier, type_="vente"):
         texte = ocr_texte(fichier) or ""
     df = lire_texte(texte, type_, nom) if len(texte.strip()) >= 40 else None
     if df is not None: return df
-    if os.getenv("ANTHROPIC_API_KEY"):
-        return lire_ia(fichier, type_)
+    apercu = " | ".join(l.strip() for l in texte.splitlines() if l.strip())[:500]
+    apercu = f" Texte lu : {apercu}" if apercu else ""
+    if cle_api():
+        try:
+            return lire_ia(fichier, type_)
+        except ValueError as e:
+            raise ValueError(f"Règles : montants HT/TTC introuvables ; IA : {e}{apercu}")
     raise ValueError("Lecture automatique impossible" + (" (scan : installez PaddleOCR ou renseignez une clé API)"
-                     if len(texte.strip()) < 40 else " (montants HT/TTC introuvables)"))
+                     if len(texte.strip()) < 40 else " (montants HT/TTC introuvables)") + "." + apercu)
 
 def lire(fichier, type_="vente"):
     if fichier.lower().endswith((".pdf", ".png", ".jpg", ".jpeg")):
