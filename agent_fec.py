@@ -11,7 +11,8 @@ Le mapping est mémorisé dans mappings/<empreinte>.json (modifiable à la main)
 PDF/images : Factur-X (XML intégré) -> texte du PDF (règles) -> OCR PaddleOCR (facultatif)
 -> IA Claude (facultatif, payant, si ANTHROPIC_API_KEY est défini).
 """
-import argparse, hashlib, json, os, re, sys, unicodedata
+import argparse, hashlib, io, json, os, re, sys, unicodedata
+import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime
@@ -32,16 +33,29 @@ TVA_LIB = "TVA"
 
 # ---------- Mapping des colonnes ----------
 SYNONYMES = {
-    "date": ["date facture", "date de facture", "date", "date emission", "date piece", "invoice date", "issue date"],
-    "numero": ["numero facture", "n facture", "n piece", "numero", "reference", "ref", "invoice number", "invoice no", "num"],
-    "tiers": ["client", "fournisseur", "tiers", "raison sociale", "nom client", "customer", "supplier", "societe"],
-    "code_tiers": ["code client", "code tiers", "compte client", "code fournisseur", "compte tiers", "customer code"],
-    "ht": ["total ht", "montant ht", "ht", "hors taxe", "net ht", "subtotal", "amount excl"],
-    "tva": ["total tva", "montant tva", "tva", "taxe", "vat", "tax amount"],
-    "ttc": ["total ttc", "montant ttc", "ttc", "total", "net a payer", "amount incl", "total amount"],
-    "taux_tva": ["taux tva", "taux de tva", "taux", "% tva", "vat rate", "tax rate"],
-    "libelle": ["libelle", "designation", "description", "objet"],
-    "compte": ["compte produit", "compte comptable", "compte"],
+    "date": ["date facture", "date de facture", "date de la facture", "date d emission", "date emission", "date piece",
+             "date de piece", "date doc", "date document", "date comptable", "date de facturation", "date facturation",
+             "invoice date", "issue date", "date of issue", "date creation", "date de creation", "created", "date"],
+    "numero": ["numero facture", "numero de facture", "n facture", "n de facture", "no facture", "num facture", "n piece",
+               "numero piece", "numero de piece", "n de piece", "reference facture", "ref facture", "invoice number",
+               "invoice no", "invoice", "document", "numero", "reference", "ref", "num", "facture", "piece"],
+    "tiers": ["client", "nom client", "nom du client", "raison sociale", "fournisseur", "nom fournisseur",
+              "nom du fournisseur", "tiers", "nom tiers", "societe", "entreprise", "denomination", "customer",
+              "customer name", "supplier", "vendor", "contact", "libelle tiers", "intitule tiers"],
+    "code_tiers": ["code client", "code tiers", "compte client", "compte tiers", "code fournisseur", "compte fournisseur",
+                   "n client", "numero client", "compte auxiliaire", "auxiliaire", "customer id", "customer code",
+                   "id client", "ref client"],
+    "ht": ["total ht", "montant ht", "ht", "hors taxe", "hors taxes", "net ht", "total hors taxe", "total hors taxes",
+           "montant hors taxe", "montant hors taxes", "base ht", "sous total", "subtotal", "amount excl", "total excl tax",
+           "net amount", "prix ht", "total net", "montant net ht", "untaxed amount"],
+    "tva": ["total tva", "montant tva", "tva", "taxe", "taxes", "vat", "tax amount", "total taxes", "montant de la tva",
+            "total vat", "montant taxe"],
+    "ttc": ["total ttc", "montant ttc", "ttc", "total", "net a payer", "amount incl", "total amount", "montant total",
+            "total toutes taxes comprises", "gross", "total due", "total a payer", "total general", "grand total",
+            "amount due", "montant a payer"],
+    "taux_tva": ["taux tva", "taux de tva", "taux", "% tva", "tva %", "vat rate", "tax rate", "tva pct", "code tva", "taux taxe"],
+    "libelle": ["libelle", "designation", "description", "objet", "intitule", "produit", "article"],
+    "compte": ["compte produit", "compte comptable", "compte", "compte de produit", "compte de charge", "code comptable", "account"],
 }
 OBLIGATOIRES = ["date", "numero", "tiers"]
 
@@ -157,60 +171,124 @@ def lire_ia(fichier, type_="vente"):
     df.attrs["anomalies"] = anom
     return df
 
-# ---------- Lecture gratuite : Factur-X, texte du PDF, OCR (optionnel) ----------
+# ---------- Lecture gratuite : XML (Factur-X/CII, UBL), texte du PDF, OCR (facultatif) ----------
 STD_TAUX = [20.0, 10.0, 5.5, 2.1, 0.0]
-MOIS = {"janvier": 1, "fevrier": 2, "mars": 3, "avril": 4, "mai": 5, "juin": 6, "juillet": 7,
-        "aout": 8, "septembre": 9, "octobre": 10, "novembre": 11, "decembre": 12}
-NB = r"(-?(?:\d{1,3}(?:[ \u00a0.,]\d{3})+|\d+)(?:[.,]\d{1,2})?)"
+MOIS = {"janvier": 1, "janv": 1, "jan": 1, "fevrier": 2, "fevr": 2, "fev": 2, "mars": 3, "mar": 3, "avril": 4,
+        "avr": 4, "mai": 5, "juin": 6, "jun": 6, "juillet": 7, "juil": 7, "aout": 8, "septembre": 9, "sept": 9,
+        "sep": 9, "octobre": 10, "oct": 10, "novembre": 11, "nov": 11, "decembre": 12, "dec": 12,
+        "january": 1, "february": 2, "feb": 2, "march": 3, "april": 4, "may": 5, "june": 6, "july": 7, "jul": 7,
+        "august": 8, "aug": 8, "september": 9, "october": 10, "november": 11, "december": 12}
+NB = r"(-?(?:\d{1,3}(?:[ .,]\d{3})+|\d+)(?:[.,]\d{1,2})?)(?![\d]|[.,]\d|\s*%)"
 TOKEN = r"([A-Z0-9][A-Z0-9\-/_.]*\d[A-Z0-9\-/_.]*)"
+D_NUM = r"(?<![\d/.\-])(?:\d{4}-\d{2}-\d{2}|\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4})(?!\d)"
+D_FR = r"\d{1,2}(?:er)?\s+[A-Za-zÀ-ÿ]{3,9}\.?,?\s+\d{4}"
+D_EN = r"[A-Za-zÀ-ÿ]{3,9}\.?\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}"
+D_ALL = re.compile("(" + D_NUM + ")|(" + D_FR + ")|(" + D_EN + ")", re.I)
 
-def _loc(e):
-    return e.tag.rsplit("}", 1)[-1]
+# ----- XML : Factur-X / ZUGFeRD (CII) et UBL -----
+def _loc(e): return e.tag.rsplit("}", 1)[-1]
+def _desc(n, nom): return [e for e in n.iter() if _loc(e) == nom]
+def _enf(n, nom): return [e for e in n if _loc(e) == nom]
+def _txt(n, nom):
+    r = _desc(n, nom)
+    return (r[0].text or "").strip() if r else ""
 
-def lire_facturx(fichier, type_="vente"):
-    """Lit le XML Factur-X / ZUGFeRD embarqué dans un PDF. None s'il n'y en a pas."""
-    try:
-        from pypdf import PdfReader
-        pieces = PdfReader(fichier).attachments
-        xml = next((c[0] for n, c in pieces.items() if n.lower().endswith(".xml")), None)
-        if xml is None: return None
-        import xml.etree.ElementTree as ET
-        racine = ET.fromstring(xml)
-        desc = lambda n, nom: [e for e in n.iter() if _loc(e) == nom]
-        val = lambda n, nom: ((desc(n, nom) or [None])[0].text or "").strip() if desc(n, nom) else ""
-        doc = desc(racine, "ExchangedDocument")[0]
-        d = val(desc(doc, "IssueDateTime")[0], "DateTimeString")
-        d = f"{d[6:8]}/{d[4:6]}/{d[:4]}" if len(d) == 8 and d.isdigit() else d
-        agr = desc(racine, "ApplicableHeaderTradeAgreement")[0]
-        tiers = val(desc(agr, "BuyerTradeParty" if type_ == "vente" else "SellerTradeParty")[0], "Name")
-        reg = desc(racine, "ApplicableHeaderTradeSettlement")[0]
-        taxes = [e for e in reg if _loc(e) == "ApplicableTradeTax"]
-        signe = -1 if val(doc, "TypeCode") == "381" else 1
-        rows, somme = [], Decimal("0")
-        for t in taxes:
-            ht, tva = montant(val(t, "BasisAmount")), montant(val(t, "CalculatedAmount")) or Decimal("0")
+def _parse_cii(racine, type_):
+    doc = _desc(racine, "ExchangedDocument")[0]
+    d = _txt(_desc(doc, "IssueDateTime")[0], "DateTimeString")
+    d = f"{d[6:8]}/{d[4:6]}/{d[:4]}" if len(d) == 8 and d.isdigit() else (_conv_date(d) or d)
+    agr = _desc(racine, "ApplicableHeaderTradeAgreement")[0]
+    tiers = _txt(_desc(agr, "BuyerTradeParty" if type_ == "vente" else "SellerTradeParty")[0], "Name")
+    reg = _desc(racine, "ApplicableHeaderTradeSettlement")[0]
+    signe = -1 if _txt(doc, "TypeCode") == "381" else 1
+    rows, somme = [], Decimal("0")
+    for t in _enf(reg, "ApplicableTradeTax"):
+        ht, tva = montant(_txt(t, "BasisAmount")), montant(_txt(t, "CalculatedAmount")) or Decimal("0")
+        if ht is None: continue
+        ht, tva = ht * signe, tva * signe
+        somme += ht + tva
+        rows.append({"Date facture": d, "N° facture": _txt(doc, "ID"), "Client": tiers, "Total HT": str(ht),
+                     "Taux TVA": _txt(t, "RateApplicablePercent"), "Total TVA": str(tva), "Total TTC": str(ht + tva)})
+    total = montant(_txt(_desc(racine, "SpecifiedTradeSettlementHeaderMonetarySummation")[0], "GrandTotalAmount"))
+    return rows, somme, (total * signe if total is not None else None), _txt(doc, "ID")
+
+def _parse_ubl(racine, type_):
+    numero = (_enf(racine, "ID") or [None])[0]
+    numero = (numero.text or "").strip() if numero is not None else ""
+    d = _conv_date(_txt(racine, "IssueDate")) or _txt(racine, "IssueDate")
+    p = _desc(racine, "AccountingCustomerParty" if type_ == "vente" else "AccountingSupplierParty")[0]
+    tiers = _txt(p, "RegistrationName") or _txt(p, "Name")
+    signe = -1 if _loc(racine) == "CreditNote" or _txt(racine, "InvoiceTypeCode") == "381" else 1
+    rows, somme = [], Decimal("0")
+    for tt in _enf(racine, "TaxTotal"):
+        for st in _enf(tt, "TaxSubtotal"):
+            ht, tva = montant(_txt(st, "TaxableAmount")), montant(_txt(st, "TaxAmount")) or Decimal("0")
             if ht is None: continue
             ht, tva = ht * signe, tva * signe
             somme += ht + tva
-            rows.append({"Date facture": d, "N° facture": val(doc, "ID"), "Client": tiers, "Total HT": str(ht),
-                         "Taux TVA": val(t, "RateApplicablePercent"), "Total TVA": str(tva), "Total TTC": str(ht + tva)})
+            rows.append({"Date facture": d, "N° facture": numero, "Client": tiers, "Total HT": str(ht),
+                         "Taux TVA": _txt(st, "Percent"), "Total TVA": str(tva), "Total TTC": str(ht + tva)})
+    lm = _enf(racine, "LegalMonetaryTotal")
+    total = montant(_txt(lm[0], "TaxInclusiveAmount")) if lm else None
+    if not rows and lm:                                   # facture sans TVA détaillée
+        ht = montant(_txt(lm[0], "TaxExclusiveAmount"))
+        if ht is not None:
+            rows.append({"Date facture": d, "N° facture": numero, "Client": tiers, "Total HT": str(ht * signe),
+                         "Taux TVA": "0", "Total TVA": "0", "Total TTC": str(ht * signe)})
+            somme = ht * signe
+    return rows, somme, (total * signe if total is not None else None), numero
+
+def _parse_xml(contenu, type_):
+    try:
+        racine = ET.fromstring(contenu)
+        nom = _loc(racine)
+        if nom == "CrossIndustryInvoice": rows, somme, total, num = _parse_cii(racine, type_)
+        elif nom in ("Invoice", "CreditNote"): rows, somme, total, num = _parse_ubl(racine, type_)
+        else: return None
         if not rows: return None
         df = pd.DataFrame(rows, columns=COLONNES_STD)
-        total = montant(val(desc(racine, "SpecifiedTradeSettlementHeaderMonetarySummation")[0], "GrandTotalAmount"))
         df.attrs["anomalies"] = []
-        if total is not None and abs(somme - total * signe) > Decimal("0.02"):
-            df.attrs["anomalies"].append((f"Factur-X : total reconstitué ({somme}) <> TTC déclaré ({total})", val(doc, "ID")))
+        if total is not None and abs(somme - total) > Decimal("0.02"):
+            df.attrs["anomalies"].append((f"XML : total reconstitué ({somme}) <> TTC déclaré ({total})", num))
         return df
     except Exception:
         return None
 
-def texte_pdf(fichier):
+def lire_facturx(fichier, type_="vente"):
+    """XML Factur-X / ZUGFeRD / UBL embarqué dans un PDF. None s'il n'y en a pas."""
+    try:
+        from pypdf import PdfReader
+        for n, c in PdfReader(fichier).attachments.items():
+            if n.lower().endswith(".xml"):
+                df = _parse_xml(c[0], type_)
+                if df is not None: return df
+    except Exception:
+        pass
+    return None
+
+def lire_xml(fichier, type_="vente"):
+    df = _parse_xml(open(fichier, "rb").read(), type_)
+    if df is None:
+        raise ValueError("XML non reconnu (Factur-X/CII ou UBL attendu)")
+    return df
+
+# ----- Texte des PDF -----
+def textes_pdf(fichier):
+    """Plusieurs extractions du texte (chacune = liste de pages) : les mises en page varient."""
+    out = []
     try:
         import pdfplumber
         with pdfplumber.open(fichier) as pdf:
-            return "\n".join((p.extract_text() or "") for p in pdf.pages)
+            out.append([(p.extract_text() or "") for p in pdf.pages])
+            out.append([(p.extract_text(layout=True) or "") for p in pdf.pages])
     except Exception:
-        return ""
+        pass
+    try:
+        from pypdf import PdfReader
+        out.append([(p.extract_text() or "") for p in PdfReader(fichier).pages])
+    except Exception:
+        pass
+    return [v for v in out if "".join(v).strip()]
 
 _OCR = None
 def ocr_texte(fichier):
@@ -254,101 +332,264 @@ def ocr_texte(fichier):
     except Exception as e:
         print(f"[OCR indisponible : {e}]", file=sys.stderr); return None
 
-def _num(texte, motifs):
+# ----- Moteur de règles sur le texte -----
+def _norm_txt(t):
+    t = t.replace("\u00a0", " ").replace("\u202f", " ").replace("’", "'").replace("‘", "'")
+    return re.sub(r"[ \t]{3,}", "  ", t)
+
+def _num(texte, motifs, dernier=False):
+    """Montant qui suit un libellé : sur la même ligne, ou seul sur la ligne suivante."""
     for m in motifs:
-        r = re.search(m + r"[^\d\n\-]{0,40}" + NB, texte, re.I)
-        if r and montant(r.group(1)) is not None:
-            return montant(r.group(1))
+        vals = []
+        for pat in (m + r"[^\d\n\-]{0,60}" + NB,
+                    m + r"[^\n\d]{0,40}\n[ ]*[€$£]?[ ]*" + NB + r"[ ]*(?:€|eur|euros?|\$|£)?[ ]*(?:\n|$)"):
+            vals = [montant(r.group(1)) for r in re.finditer(pat, texte, re.I | re.M)]
+            vals = [v for v in vals if v is not None]
+            if vals: break
+        if vals: return vals[-1] if dernier else vals[0]
     return None
 
+DEV = r"(?:\(?\s*(?:eur|€|euros?)\s*\)?\s*)?"
+MOTIFS_HT = [r"total\s*" + DEV + r"(?:net\s*)?h\.?\s?t\.?(?![a-z])", r"total\s*hors\s*t(?:axes?|\.?v\.?a\.?)",
+             r"montant\s*(?:total\s*)?(?:h\.?\s?t\.?(?![a-z])|hors\s*taxes?)",
+             r"total\s*(?:net\s*)?(?:avant|hors)\s*(?:tva|taxes?)", r"net\s*h\.?\s?t\.?(?![a-z])",
+             r"total\s*(?:excl(?:uding|\.)?\s*(?:vat|tax)|before\s*tax)", r"untaxed\s*amount", r"net\s*amount", r"total\s*net\s*amount",
+             r"sous[\s-]?total(?:\s*h\.?\s?t\.?(?![a-z]))?", r"subtotal", r"montant\s*net", r"base\s*h\.?\s?t\.?(?![a-z])"]
+MOTIFS_TTC = [r"total\s*" + DEV + r"(?:g[ée]n[ée]ral\s*)?t\.?t\.?c\.?", r"montant\s*(?:total\s*)?t\.?t\.?c\.?",
+              r"total\s*(?:tva\s*(?:incluse|comprise)|toutes?\s*taxes?\s*comprises?)",
+              r"total\s*(?:incl(?:uding|\.)?\s*(?:vat|tax))", r"grand\s*total", r"gross\s*total", r"total\s*gross", r"total\s*amount", r"total\s*due",
+              r"amount\s*due", r"net\s*[àa]\s*payer", r"total\s*[àa]\s*(?:payer|r[ée]gler)", r"[àa]\s*r[ée]gler",
+              r"montant\s*total", r"total\s*g[ée]n[ée]ral"]
+MOTIFS_TVA = [r"total\s*t\.?v\.?a\.?", r"montant\s*(?:de\s*la\s*)?t\.?v\.?a\.?", r"total\s*(?:vat|tax(?:es)?)",
+              r"(?<![a-z])(?:t\.?v\.?a\.?|vat)\s*(?:\(?\d{1,2}(?:[.,]\d{1,2})?\s*%\)?)?"]
+MOTIF_TOTAL_SEUL = [r"^[ ]*total(?!\s*(?:h|t\.?v|hors|net|g|excl|incl|amount|due))"]
+
 def _totaux_tableau(lignes):
-    """Cas du tableau : en-tête 'HT TVA TTC' puis une ligne de 3 montants."""
+    """Tableau : en-tête 'HT / TVA / TTC' puis une ligne de montants."""
     for i, l in enumerate(lignes):
-        if re.search(r"h\.?t\b", l, re.I) and re.search(r"t\.?t\.?c", l, re.I):
-            for s in lignes[i + 1:i + 3]:
+        if re.search(r"h\.?t\b", l, re.I) and re.search(r"t\.?t\.?c|t\.?v\.?a", l, re.I):
+            for s in lignes[i + 1:i + 4]:
                 v = [montant(x) for x in re.findall(NB, s)]
                 v = [x for x in v if x is not None]
-                if len(v) >= 3 and abs(v[-3] + v[-2] - v[-1]) <= Decimal("0.02"):
-                    return v[-3], v[-1]
+                if len(v) >= 3 and abs(v[-3] + v[-2] - v[-1]) <= Decimal("0.02"): return v[-3], v[-1]
+                if len(v) == 2 and 0 < v[0] < v[1] <= v[0] * Decimal("1.25"): return v[0], v[1]
     return None, None
 
+def _taux_lignes(lignes):
+    """Lignes à un seul taux (ex. '20 %  145,83  29,17') -> (taux, base, tva), selon que la ligne
+    contient base+TVA (A) ou base+TTC (B). Les montants sont reconnus par le calcul, pas par leur place."""
+    A, B = [], []
+    for l in lignes:
+        p = list(re.finditer(r"(\d{1,2}(?:[.,]\d{1,2})?)\s*%", l))
+        if len(p) != 1: continue
+        r = Decimal(p[0].group(1).replace(",", "."))
+        nums = [montant(x) for x in re.findall(NB, l[:p[0].start()] + " " + l[p[0].end():])]
+        nums = [abs(x) for x in nums if x is not None]
+        pa = [(b, v) for i, b in enumerate(nums) for j, v in enumerate(nums)
+              if i != j and b > v and abs(b * r / 100 - v) <= Decimal("0.02")]
+        pb = [(b, t - b) for i, b in enumerate(nums) for j, t in enumerate(nums)
+              if i != j and t > b and r > 0 and abs(b * (1 + r / 100) - t) <= Decimal("0.02")]
+        if pa: b, v = max(pa); A.append((float(r), b, v))
+        elif pb: b, v = max(pb); B.append((float(r), b, v))
+    return A, B
+
+def _ventiler(candidats, ht, tva_tot):
+    for rows in candidats:
+        if not rows: continue
+        g = OrderedDict()
+        for r, b, v in rows:
+            b0, v0 = g.get(r, (Decimal("0"), Decimal("0")))
+            g[r] = (b0 + b, v0 + v)
+        if abs(sum(b for b, _ in g.values()) - abs(ht)) <= Decimal("0.05") and \
+           abs(sum(v for _, v in g.values()) - abs(tva_tot)) <= Decimal("0.05"):
+            return [(r, b, v) for r, (b, v) in g.items()]
+    return None
+
+# ----- date -----
+def _conv_date(d):
+    d = d.strip()
+    r = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", d)
+    if r: return f"{r.group(3)}/{r.group(2)}/{r.group(1)}"
+    if re.fullmatch(D_NUM, d):
+        r = re.fullmatch(r"(\d{1,2})([/.\-])(\d{1,2})[/.\-](\d{2,4})", d)
+        if r and int(r.group(3)) > 12 and int(r.group(1)) <= 12:      # 03/15/2026 : format américain évident
+            return f"{r.group(3)}/{r.group(1)}/{r.group(4)}"
+        return d
+    r = re.fullmatch(r"(\d{1,2})(?:er)?\s+([A-Za-zÀ-ÿ]{3,9})\.?,?\s+(\d{4})", d)
+    if r: jour, mois, an = r.groups()
+    else:
+        r = re.fullmatch(r"([A-Za-zÀ-ÿ]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})", d)
+        if not r: return ""
+        mois, jour, an = r.groups()
+    m = MOIS.get(norm(mois))
+    return f"{int(jour):02d}/{m:02d}/{an}" if m else ""
+
+LAB_DATE = [r"date\s*(?:de\s*la\s*|de\s*|d')?(?:facture|facturation|[ée]mission|[ée]dition|pi[eè]ce|document|comptable)",
+            r"(?:invoice|issue|issued)\s*date", r"date\s*of\s*(?:invoice|issue)", r"[ée]mise?\s*le", r"factur[ée]e?\s*le",
+            r"facture\s*du", r"fait\s*le", r"\bdate\b"]
+
 def _date_texte(texte):
-    r = (re.search(r"date(?:\s*(?:de|d')\s*(?:facture|facturation|[ée]mission))?\s*:?\s*(\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4})", texte, re.I)
-         or re.search(r"\b(\d{1,2}[/.\-]\d{1,2}[/.\-]\d{4})\b", texte))
-    if r: return r.group(1)
-    r = re.search(r"(\d{1,2})(?:er)?\s+(janvier|f[ée]vrier|mars|avril|mai|juin|juillet|ao[uû]t|septembre|octobre|novembre|d[ée]cembre)\s+(\d{4})", texte, re.I)
-    return f"{int(r.group(1)):02d}/{MOIS[norm(r.group(2))]:02d}/{r.group(3)}" if r else ""
+    t = _norm_txt(texte)
+    ds = []
+    for r in D_ALL.finditer(t):
+        v = _conv_date(r.group(0))
+        if v: ds.append((r.start(), r.end(), v))
+    for pat in LAB_DATE:                                   # date derrière un libellé (même ligne ou ligne suivante)
+        for m in re.finditer(pat, t, re.I):
+            for d0, _, v in ds:
+                if d0 >= m.end():
+                    if not t[m.end():d0].strip(" :.-\t\n"): return v
+                    break
+    for d0, _, v in ds:                                    # sinon 1re date qui n'est pas une échéance
+        if not re.search(r"[ée]ch[ée]ance|due|limite|paiement|r[èe]glement|livraison|validit|expir|avant le", t[max(0, d0 - 30):d0], re.I):
+            return v
+    return ds[0][2] if ds else ""
+
+# ----- numéro -----
+PATS_NUM = [
+    (True, r"(?:facture|avoir|invoice|credit\s*note|note\s*de\s*cr[ée]dit|pi[eè]ce|document)\s*(?:d'avoir\s*)?"
+           r"(?:n[°ºo]\.?|num[ée]ro|number|no\.?|nr\.?|#|r[ée]f(?:[ée]rence)?\.?)\s*:?\s*"),
+    (True, r"(?:n[°ºo]\.?|num[ée]ro|number|no\.?|#|r[ée]f(?:[ée]rence)?\.?)\s*(?:de\s*|d')?(?:facture|invoice|pi[eè]ce|avoir)\s*:?\s*"),
+    (False, r"(?:facture|avoir|invoice)\s*:?\s*"),
+    (True, r"\bnum[ée]ro\s*:?\s*"),
+    (True, r"\bn[°º]\s*:?\s*"),
+]
+
+def _numero(texte):
+    t = _norm_txt(texte)
+    for explicite, pat in PATS_NUM:
+        for r in re.finditer(pat + TOKEN, t, re.I):
+            c = r.group(1).strip(".-/_,")
+            if not c or re.fullmatch(D_NUM, c) or re.fullmatch(r"(?:19|20)\d{2}", c) or re.fullmatch(r"\d{9}|\d{14}", c): continue
+            if len(c) < (1 if explicite else 4): continue
+            if re.search(r"siren|siret|tva|iban|bic|t[ée]l|rcs|naf|ape|client|compte", t[max(0, r.start(1) - 18):r.start(1)], re.I) \
+               and not re.search(r"facture|invoice|avoir", t[max(0, r.start(1) - 18):r.start(1)], re.I): continue
+            return c
+    return ""
+
+# ----- tiers -----
+ETIQ = {"vente": r"(?:factur[ée]e?\s*[àa]|adresse\s*de\s*facturation|[àa]\s*l'attention\s*de|[àa]\s*destination\s*de|"
+                 r"destinataire|client|customer|bill(?:ed)?\s*to|sold\s*to|adress[ée]e?\s*[àa]|nom\s*du\s*client)",
+        "achat": r"(?:fournisseur|[ée]metteur|vendeur|vendu\s*par|prestataire|envoy[ée]e?\s*par|from|seller|supplier)"}
+NON_NOM = (r"^(?:facture|avoir|invoice|devis|date|num[ée]ro|n[°º]|total|page|adresse|siret|siren|tva|iban|bic|t[ée]l|"
+           r"email|e-mail|r[ée]f|code|france|paiement|conditions|mode|ech[ée]ance|objet|d[ée]signation|description|"
+           r"quantit[ée]|prix|montant|bon\s*de|commande)\b")
+RUE = r"(?:rue|avenue|av|bd|boulevard|chemin|impasse|place|all[ée]e|route|cours|quai|zone|za|zi|lotissement|r[ée]sidence)"
+
+def _nom_valide(s):
+    s = s.strip(" :-|")
+    if len(re.findall(r"[A-Za-zÀ-ÿ]", s)) < 3 or "@" in s or re.search(r"\d{8,}", s.replace(" ", "")): return False
+    if re.match(NON_NOM, s, re.I) or re.match(r"^\d{5}\b", s): return False
+    if re.match(rf"^(?:\d{{1,4}}\s*(?:bis|ter)?[\s,]+)?{RUE}\b", s, re.I): return False
+    return True
+
+def _nettoyer_nom(s):
+    s = re.sub(r"^(?:facture|avoir|invoice)\s+", "", s.strip(" :-|"), flags=re.I)
+    return re.split(r"\s{2,}|\s+(?:date|n[°º]|num[ée]ro|r[ée]f|page|t[ée]l|email|e-mail|siret|siren|tva)\b", s, 1, flags=re.I)[0].strip(" :-|")
 
 def _tiers_texte(lignes, type_):
-    etiq = (r"(?:factur[ée]e?\s*[àa]|client|destinataire|bill(?:ed)?\s*to|adress[ée]e?\s*[àa])" if type_ == "vente"
-            else r"(?:fournisseur|[ée]metteur|vendeur|from)")
     for i, l in enumerate(lignes):
-        m = re.match(rf"\s*{etiq}\s*:?\s*(.*)$", l, re.I)
-        if m:
-            if len(m.group(1).strip()) > 2: return m.group(1).strip()
-            for s in lignes[i + 1:i + 3]:
-                if s.strip(): return s.strip()
+        m = re.match(rf"\s*{ETIQ[type_]}\s*:?\s*(.*)$", l, re.I)
+        if not m: continue
+        for cand in [m.group(1)] + lignes[i + 1:i + 5]:
+            c = _nettoyer_nom(cand)
+            if c and _nom_valide(c): return c
     if type_ == "achat":
-        for l in lignes:
-            if re.search(r"[A-Za-z]{3}", l) and not re.match(r"\s*(facture|avoir|invoice)", l, re.I): return l.strip()
+        for l in lignes[:12]:
+            c = _nettoyer_nom(l)
+            if c and _nom_valide(c): return c
     return ""
 
 def lire_texte(texte, type_, nom):
     """Extraction par règles à partir du texte d'une facture (une facture par document)."""
-    lignes = [l.strip() for l in texte.splitlines() if l.strip()]
-    anom, numero = [], ""
-    for pat in (r"(?:facture|avoir|invoice|credit note)\s*(?:n[°ºo]\.?|num[ée]ro|no\.?|#)?\s*:?\s*" + TOKEN,
-                r"\bn[°º]\s*(?:de\s*facture)?\s*:?\s*" + TOKEN):
-        for r in re.finditer(pat, texte, re.I):
-            c = r.group(1).strip(".-/_")
-            if not re.fullmatch(r"\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}", c):
-                numero = c; break
-        if numero: break
+    t = _norm_txt(texte)
+    lignes = [l.strip() for l in t.splitlines() if l.strip()]
+    anom, numero = [], _numero(t)
+    trouve = bool(numero)
     if not numero:
         numero = nom; anom.append(("N° de facture non trouvé (nom du fichier utilisé)", nom))
-    ht = _num(texte, [r"total\s*h\.?\s?t\.?", r"montant\s*h\.?\s?t\.?", r"sous[\s-]?total(?:\s*h\.?\s?t\.?)?", r"net\s*h\.?\s?t\.?"])
-    ttc = _num(texte, [r"total\s*t\.?t\.?c\.?", r"net\s*[àa]\s*payer", r"montant\s*t\.?t\.?c", r"total\s*[àa]\s*payer", r"total\s*due", r"amount\s*due"])
-    tva = _num(texte, [r"total\s*t\.?v\.?a\.?", r"montant\s*t\.?v\.?a\.?"])
+    ht, ttc, tva_exp = _num(t, MOTIFS_HT), _num(t, MOTIFS_TTC), _num(t, MOTIFS_TVA)
+    if ttc is None: ttc = _num(t, MOTIF_TOTAL_SEUL, dernier=True)
     if ht is None or ttc is None:
         h2, t2 = _totaux_tableau(lignes)
         ht = ht if ht is not None else h2; ttc = ttc if ttc is not None else t2
-    if ht is None and ttc is not None and tva is not None: ht = ttc - tva
-    if ttc is None and ht is not None and tva is not None: ttc = ht + tva
+    if ht is None and ttc is not None and tva_exp is not None: ht = ttc - tva_exp
+    if ttc is None and ht is not None and tva_exp is not None: ttc = ht + tva_exp
+    if re.search(r"tva\s*non\s*applicable|art(?:icle|\.)?\s*293\s*b|franchise\s*en\s*base|exon[ée]r[ée]e?\s*de\s*tva|vat\s*exempt", t, re.I):
+        if ht is None and ttc is not None: ht = ttc
+        if ttc is None and ht is not None: ttc = ht
     if ht is None or ttc is None or ht == 0:
         return None
-    if tva is not None and abs(ht + tva - ttc) > Decimal("0.02"):
-        anom.append((f"HT ({ht}) + TVA ({tva}) <> TTC ({ttc})", numero))
-    tva = ttc - ht
-    if re.search(r"\bavoir\b|credit note", " ".join(lignes[:15]), re.I) and ht > 0:
-        ht, tva, ttc = -ht, -tva, -ttc
-    calc = float(tva / ht * 100)
-    proche = min(STD_TAUX, key=lambda t: abs(t - calc))
-    if abs(proche - calc) <= 0.3: taux = proche
+    if tva_exp is not None and abs(ht + tva_exp - ttc) > Decimal("0.02"):
+        anom.append((f"HT ({ht}) + TVA ({tva_exp}) <> TTC ({ttc})", numero))
+    tva_tot = ttc - ht
+    A, B = _taux_lignes(lignes)
+    vent = _ventiler([list(OrderedDict.fromkeys(A)), A, B], ht, tva_tot)
+    if vent is None:
+        if tva_tot == 0: vent = [(0.0, ht, Decimal("0"))]
+        else:
+            calc = float(tva_tot / ht * 100)
+            proche = min(STD_TAUX, key=lambda x: abs(x - calc))
+            if abs(proche - calc) <= 0.3: taux = proche
+            else:
+                taux = round(calc, 1)
+                anom.append((f"Taux de TVA calculé {taux} % : facture multi-taux ou erreur, à vérifier", numero))
+            vent = [(taux, ht, tva_tot)]
     else:
-        taux = round(calc, 1)
-        anom.append((f"Taux de TVA calculé {taux} % : facture multi-taux ou erreur, à vérifier", numero))
+        diff = ttc - sum(b + v for _, b, v in vent)
+        if diff and abs(diff) <= Decimal("0.05"):
+            r_, b_, v_ = vent[-1]; vent[-1] = (r_, b_, v_ + diff)
+    avoir = re.search(r"^\s*(?:facture\s*d')?avoir\b(?!\s*lieu)|credit\s*note|note\s*de\s*cr[ée]dit|facture\s*d'avoir",
+                      "\n".join(lignes[:25]), re.I | re.M)
+    sg = -1 if (avoir and ht > 0) else 1
+    if re.search(r"autoliquidation|reverse\s*charge", t, re.I):
+        anom.append(("Autoliquidation de TVA : écritures de TVA à traiter manuellement", numero))
+    if re.search(r"\b(?:USD|GBP|CHF)\b|[$£]", t) and not re.search(r"€|\bEUR\b|euros?", t, re.I):
+        anom.append(("Devise autre que l'euro : montants à convertir", numero))
     tiers = _tiers_texte(lignes, type_)
     if not tiers:
         tiers = "A IDENTIFIER"; anom.append(("Tiers non identifié", numero))
-    df = pd.DataFrame([{"Date facture": _date_texte(texte), "N° facture": numero, "Client": tiers,
-                        "Total HT": str(ht), "Taux TVA": str(taux), "Total TVA": str(tva), "Total TTC": str(ttc)}],
-                      columns=COLONNES_STD)
-    df.attrs["anomalies"] = anom
+    d = _date_texte(t)
+    df = pd.DataFrame([{"Date facture": d, "N° facture": numero, "Client": tiers, "Total HT": str(sg * b),
+                        "Taux TVA": taux_str(r), "Total TVA": str(sg * v), "Total TTC": str(sg * (b + v))}
+                       for r, b, v in vent], columns=COLONNES_STD)
+    df.attrs["anomalies"], df.attrs["numero_trouve"] = anom, trouve
     return df
 
+def _lire_pages(pages, type_, nom):
+    """Un PDF peut contenir plusieurs factures (une par page) : on les sépare si les numéros diffèrent."""
+    if len(pages) > 1:
+        res = []
+        for i, p in enumerate(pages, 1):
+            if len(p.strip()) < 40: continue
+            d = lire_texte(p, type_, f"{nom}-p{i}")
+            if d is not None and d.attrs.get("numero_trouve"): res.append(d)
+        if len(res) >= 2 and len({d.iloc[0]["N° facture"] for d in res}) >= 2:
+            df = pd.concat(res, ignore_index=True)
+            df.attrs["anomalies"] = [a for d in res for a in d.attrs["anomalies"]]
+            return df
+    return lire_texte("\n".join(pages), type_, nom)
+
 def lire_pdf(fichier, type_="vente"):
-    """Cascade : Factur-X -> texte du PDF -> OCR (si installé) -> IA (si clé API)."""
+    """Cascade : XML intégré -> texte du PDF (3 extractions) -> OCR (si installé) -> IA (si clé API)."""
     ext = os.path.splitext(fichier)[1].lower()
     nom = os.path.splitext(os.path.basename(fichier))[0]
-    texte = ""
+    variantes = []
     if ext == ".pdf":
         df = lire_facturx(fichier, type_)
         if df is not None: return df
-        texte = texte_pdf(fichier)
-    if len(texte.strip()) < 40:
-        texte = ocr_texte(fichier) or ""
-    df = lire_texte(texte, type_, nom) if len(texte.strip()) >= 40 else None
-    if df is not None: return df
+        variantes = textes_pdf(fichier)
+    if not any(len("".join(v).strip()) >= 40 for v in variantes):
+        t = ocr_texte(fichier)
+        variantes = [[t]] if t else []
+    best = None
+    for pages in variantes:
+        cand = _lire_pages(pages, type_, nom)
+        if cand is not None and (best is None or len(cand.attrs["anomalies"]) < len(best.attrs["anomalies"])):
+            best = cand
+            if not cand.attrs["anomalies"]: break
+    if best is not None: return best
+    texte = "\n".join(variantes[0]) if variantes else ""
     apercu = " | ".join(l.strip() for l in texte.splitlines() if l.strip())[:500]
     apercu = f" Texte lu : {apercu}" if apercu else ""
     if cle_api():
@@ -360,22 +601,40 @@ def lire_pdf(fichier, type_="vente"):
                      if len(texte.strip()) < 40 else " (montants HT/TTC introuvables)") + "." + apercu)
 
 def lire(fichier, type_="vente"):
+    if fichier.lower().endswith(".xml"):
+        return lire_xml(fichier, type_)
     if fichier.lower().endswith((".pdf", ".png", ".jpg", ".jpeg")):
         return lire_pdf(fichier, type_)
     if fichier.lower().endswith((".xlsx", ".xls", ".xlsm")):
-        return pd.read_excel(fichier, dtype=str)
+        brut = pd.read_excel(fichier, dtype=str, header=None)
+        i = _entete_index(brut.fillna("").values.tolist())
+        df = brut.iloc[i + 1:].reset_index(drop=True)
+        df.columns = [str(c) if pd.notna(c) else f"col{k}" for k, c in enumerate(brut.iloc[i])]
+        return df.dropna(how="all")
     for enc in ("utf-8-sig", "cp1252", "latin-1"):
         try:
-            return pd.read_csv(fichier, sep=None, engine="python", dtype=str, encoding=enc)
+            texte = open(fichier, encoding=enc).read()
+            break
         except UnicodeDecodeError:
             continue
-    raise ValueError("Encodage illisible")
+    lignes = texte.splitlines()
+    delim = max(";\t,|", key=lambda d: sum(l.count(d) for l in lignes[:20]))
+    i = _entete_index([l.split(delim) for l in lignes[:30]])
+    return pd.read_csv(io.StringIO("\n".join(lignes[i:])), sep=delim, dtype=str, engine="python").dropna(how="all")
+
+def _entete_index(lignes_cellules):
+    """Index de la 1re ligne contenant au moins 3 intitulés de colonnes connus."""
+    connus = {x for syns in SYNONYMES.values() for x in syns}
+    for i, cells in enumerate(lignes_cellules[:30]):
+        if sum(norm(c) in connus for c in cells) >= 3: return i
+    return 0
 
 def montant(v):
     if v is None or (isinstance(v, float) and pd.isna(v)) or str(v).strip() in ("", "nan"):
         return None
     s = re.sub(r"[^\d,.\-]", "", str(v).replace("\u202f", "").replace(" ", ""))
     if s.startswith("(") : s = "-" + s
+    if re.fullmatch(r"-?\d{1,3}([.,]\d{3})+", s): s = re.sub(r"[.,]", "", s)
     if "," in s and "." in s:
         s = s.replace(",", "") if s.rfind(".") > s.rfind(",") else s.replace(".", "").replace(",", ".")
     else:
@@ -385,7 +644,7 @@ def montant(v):
 
 def date(v):
     s = str(v).strip()[:10]
-    for f in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%y", "%Y/%m/%d"):
+    for f in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%y", "%d.%m.%y", "%d-%m-%y", "%Y/%m/%d"):
         try: return datetime.strptime(s, f)
         except ValueError: pass
     return None
@@ -481,8 +740,10 @@ def construire_ecritures(lignes, type_, anomalies, regles=None):
         ht_tot = sum(x["ht"] for x in ls); tva_par_taux = OrderedDict()
         for x in ls: tva_par_taux[x["taux"]] = tva_par_taux.get(x["taux"], Decimal("0")) + x["tva"]
         tva_tot = sum(tva_par_taux.values()); ttc_calc = ht_tot + tva_tot
-        ttc_src = sum(x["ttc"] for x in ls) if all(x["ttc"] is not None for x in ls) else None
-        if ttc_src is not None and abs(ttc_src - ttc_calc) > Decimal("0.02"):
+        ttcs = [x["ttc"] for x in ls]
+        ttc_src = sum(ttcs) if all(v is not None for v in ttcs) else None
+        if ttc_src is not None and abs(ttc_src - ttc_calc) > Decimal("0.02") \
+           and not (len(ls) > 1 and abs(ttcs[0] - ttc_calc) <= Decimal("0.02")):
             anomalies.append((ls[0]["n"], f"HT+TVA ({ttc_calc}) <> TTC ({ttc_src})", numero))
         for t in tva_par_taux:
             if t not in TVA_COMPTES and t not in ("0", "0.0"):
