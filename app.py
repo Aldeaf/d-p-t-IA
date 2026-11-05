@@ -9,7 +9,7 @@ st.title("🧾 Factures → FEC pour ACD")
 ss = st.session_state
 
 # Vérifie que agent_fec.py est bien la dernière version (sinon message clair au lieu d'une erreur masquée)
-_REQUIS = ["VERSION", "CHAMPS_LIBELLES", "importer_reglages", "exporter_reglages", "fusionner_modele", "sauver_mapping", "OBLIGATOIRES", "TVA_COMPTES"]
+_REQUIS = ["VERSION", "CHAMPS_LIBELLES", "importer_reglages", "exporter_reglages", "fusionner_modele", "sauver_mapping", "creer_archive", "OBLIGATOIRES", "TVA_COMPTES"]
 _manque = [n for n in _REQUIS if not hasattr(ag, n)]
 if _manque:
     st.error("agent_fec.py n'est pas à jour sur GitHub (il manque : " + ", ".join(_manque) +
@@ -56,6 +56,29 @@ def mapping_choisi(nom):
     m = {ch: ss.get(f"map_{nom}_{ch}") for ch in ag.CHAMPS_LIBELLES}
     return {k: v for k, v in m.items() if v and v != "(aucune)"}
 
+def afficher_piece(e):
+    """Affiche la facture d'origine d'une écriture (PDF, image, XML ou ligne du CSV/Excel)."""
+    chemin = os.path.join(ss.tmp, e["src"])
+    page = f", page {e['page']}" if e["page"] else ""
+    st.markdown(f"**👁️ Facture {e['piece']}** · {e['src']}{page}")
+    ext = os.path.splitext(chemin)[1].lower()
+    try:
+        if ext == ".pdf":
+            import pdfplumber
+            with pdfplumber.open(chemin) as pdf:
+                pages = [pdf.pages[int(e["page"]) - 1]] if e["page"] else pdf.pages[:4]
+                for p in pages:
+                    st.image(p.to_image(resolution=110).original, use_container_width=True)
+        elif ext in (".png", ".jpg", ".jpeg"):
+            st.image(chemin, use_container_width=True)
+        elif ext == ".xml":
+            st.code(open(chemin, encoding="utf-8", errors="replace").read()[:4000], language="xml")
+        else:
+            df = ag.lire(chemin)
+            st.dataframe(df[df.astype(str).apply(lambda l: str(e["piece"]) in l.values, axis=1)], use_container_width=True)
+    except Exception as ex:
+        st.warning(f"Aperçu impossible : {ex}")
+
 # ---------- page ----------
 LIBELLES = {"vente": "🧑‍💼 Clients (factures de vente)", "achat": "🏭 Fournisseurs (factures d'achat)"}
 type_ = st.radio("Je traite des…", list(LIBELLES), format_func=LIBELLES.get, horizontal=True)
@@ -87,7 +110,8 @@ with tab1:
         try:
             with st.spinner("Analyse en cours…"):
                 ss.res = ag.traiter(list(chemins.values()), type_, siren, exercice, ss.tmp,
-                                    regles=ss.get("imput_courant", ss.imput_base), mappings=maps, comptes=c, tva_comptes=t)
+                                    regles=ss.get("imput_courant", ss.imput_base), mappings=maps, comptes=c, tva_comptes=t,
+                                    separateur="pipe" if ss.get("sep_fec") == "Pipe |" else "tab")
             ss.err = None
         except ValueError as e:
             ss.res, ss.err = None, str(e)
@@ -105,6 +129,9 @@ with tab1:
         c3.metric("Anomalies", len(r["anomalies"]))
         st.download_button("⬇️ Télécharger le FEC", open(r["fec"], "rb").read(),
                            file_name=os.path.basename(r["fec"]), mime="text/plain", type="primary")
+        if r.get("zip"):
+            st.download_button("📎 FEC + pièces jointes (zip)", open(r["zip"], "rb").read(),
+                               file_name=os.path.basename(r["zip"]), mime="application/zip")
         if r["sans_regle"]:
             st.subheader("Comptes à renseigner")
             st.caption("Ces tiers n'ont pas de règle : le compte par défaut a été utilisé. "
@@ -125,9 +152,23 @@ with tab1:
             st.warning("Points à vérifier avant import dans ACD :")
             st.dataframe(pd.DataFrame(rest, columns=["Fichier:ligne", "Anomalie", "Détail"]), use_container_width=True)
             st.download_button("Télécharger le rapport", open(r["rapport"], "rb").read(), file_name="rapport_anomalies.csv")
-        st.subheader("Aperçu des écritures")
-        st.dataframe(pd.DataFrame(r["ecritures"])[["num", "date", "compte", "aux", "piece", "lib", "debit", "credit"]],
-                     use_container_width=True)
+        st.subheader("Écritures")
+        st.caption("Touchez une ligne pour afficher la facture correspondante.")
+        ecr = pd.DataFrame(r["ecritures"])
+        sel = None
+        try:
+            ev = st.dataframe(ecr[["num", "date", "compte", "aux", "piece", "lib", "debit", "credit"]],
+                              on_select="rerun", selection_mode="single-row", hide_index=True,
+                              use_container_width=True, key="tbl_ecr")
+            if ev.selection.rows:
+                sel = ecr.iloc[ev.selection.rows[0]]
+        except TypeError:                                   # anciennes versions de Streamlit
+            uniques = ecr.drop_duplicates("num")
+            choix = st.selectbox("Facture à afficher", ["(aucune)"] + [f"{p.num} - {p.piece}" for p in uniques.itertuples()])
+            if choix != "(aucune)":
+                sel = uniques[uniques["num"] == int(choix.split(" - ")[0])].iloc[0]
+        if sel is not None:
+            afficher_piece(sel)
 
 with tab2:
     st.caption("Si le nom du tiers contient le motif, le compte est utilisé. Colonne type : achat, vente, ou vide pour les deux. "
@@ -187,6 +228,10 @@ with tab3:
         st.markdown("**Comptes de TVA par taux**")
         ss.tva_courant = st.data_editor(ss.tva_base, num_rows="dynamic", hide_index=True,
                                         use_container_width=True, key="ed_tva")
+    with st.expander("📄 Format du FEC"):
+        st.radio("Séparateur des colonnes", ["Tabulation", "Pipe |"], horizontal=True, key="sep_fec")
+        st.caption("Les deux sont admis pour un FEC. Choisissez celui que votre import ACD accepte (certaines sources "
+                   "indiquent que le FEC pour ACD utilise le séparateur pipe : à confirmer auprès d'ACD).")
     with st.expander("💾 Sauvegarde des réglages"):
         c, t = comptes_ui()
         st.download_button("⬇️ Télécharger mes réglages (reglages.json)",

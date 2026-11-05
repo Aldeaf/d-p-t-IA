@@ -11,8 +11,8 @@ Le mapping est mémorisé dans mappings/<empreinte>.json (modifiable à la main)
 PDF/images : Factur-X (XML intégré) -> texte du PDF (règles) -> OCR PaddleOCR (facultatif)
 -> IA Claude (facultatif, payant, si ANTHROPIC_API_KEY est défini).
 """
-import argparse, hashlib, io, json, os, re, sys, unicodedata
-VERSION = "2026.11.05-d"
+import argparse, hashlib, io, json, os, re, shutil, sys, tempfile, unicodedata, zipfile
+VERSION = "2026.11.05-e"
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from decimal import Decimal, ROUND_HALF_UP
@@ -599,7 +599,9 @@ def _lire_pages(pages, type_, nom):
         for i, p in enumerate(pages, 1):
             if len(p.strip()) < 40: continue
             d = lire_texte(p, type_, f"{nom}-p{i}")
-            if d is not None and d.attrs.get("numero_trouve"): res.append(d)
+            if d is not None and d.attrs.get("numero_trouve"):
+                d["Page"] = i
+                res.append(d)
         if len(res) >= 2 and len({d.iloc[0]["N° facture"] for d in res}) >= 2:
             df = pd.concat(res, ignore_index=True)
             df.attrs["anomalies"] = [a for d in res for a in d.attrs["anomalies"]]
@@ -714,8 +716,9 @@ def vers_pivot(df, m, anomalies, src=""):
         if taux is None:
             taux = (tva / ht * 100).quantize(Decimal("0.1")) if ht else Decimal("0")
         g = lambda k: (str(r[m[k]]).strip() if k in m and pd.notna(r[m[k]]) else "")
+        page = str(int(float(r["Page"]))) if "Page" in df.columns and pd.notna(r["Page"]) else ""
         lignes.append(dict(n=n, date=d, numero=g("numero"), tiers=g("tiers"), code=g("code_tiers"),
-                           libelle=g("libelle"), compte=g("compte"), ht=ht, tva=tva, ttc=ttc,
+                           libelle=g("libelle"), compte=g("compte"), page=page, ht=ht, tva=tva, ttc=ttc,
                            taux=taux_str(taux)))
     return lignes
 
@@ -828,6 +831,7 @@ def construire_ecritures(lignes, type_, anomalies, regles=None, comptes=None, tv
         if numero and cle in vus: anomalies.append((ls[0]["n"], "Doublon possible", numero))
         vus.add(cle)
         d = ls[0]["date"]
+        src, page = ls[0]["n"].rsplit(":", 1)[0], ls[0].get("page", "")
         ht_tot = sum(x["ht"] for x in ls); tva_par_taux = OrderedDict()
         for x in ls: tva_par_taux[x["taux"]] = tva_par_taux.get(x["taux"], Decimal("0")) + x["tva"]
         tva_tot = sum(tva_par_taux.values()); ttc_calc = ht_tot + tva_tot
@@ -846,7 +850,7 @@ def construire_ecritures(lignes, type_, anomalies, regles=None, comptes=None, tv
         def ecr(compte, libc, aux_n, aux_l, montant_, sens):
             if montant_ == 0: return
             sens = sens if not avoir else ("C" if sens == "D" else "D")
-            ecritures.append(dict(num=num, date=d, compte=compte, libc=libc, aux=aux_n, auxl=aux_l,
+            ecritures.append(dict(num=num, src=src, page=page, date=d, compte=compte, libc=libc, aux=aux_n, auxl=aux_l,
                                   piece=numero, lib=lib, debit=abs(montant_) if sens == "D" else Decimal("0"),
                                   credit=abs(montant_) if sens == "C" else Decimal("0")))
         st = cfg["sens_tiers"]; sc = "C" if st == "D" else "D"
@@ -872,7 +876,7 @@ FEC_COLS = ["JournalCode","JournalLib","EcritureNum","EcritureDate","CompteNum",
             "CompAuxLib","PieceRef","PieceDate","EcritureLib","Debit","Credit","EcritureLet","DateLet",
             "ValidDate","Montantdevise","Idevise"]
 
-def ecrire_fec(ecritures, type_, siren, exercice, sortie, comptes=None):
+def ecrire_fec(ecritures, type_, siren, exercice, sortie, comptes=None, separateur="tab"):
     jc, jl = (comptes or COMPTES)[type_]["journal"]
     fmt = lambda x: f"{x:.2f}".replace(".", ",")
     d_tot = sum(e["debit"] for e in ecritures); c_tot = sum(e["credit"] for e in ecritures)
@@ -880,16 +884,57 @@ def ecrire_fec(ecritures, type_, siren, exercice, sortie, comptes=None):
     fin = max(e["date"] for e in ecritures).strftime("%Y%m%d")
     nom = os.path.join(sortie, f"{siren}FEC{exercice}1231.txt") if exercice else os.path.join(sortie, f"{siren}FEC{fin}.txt")
     with open(nom, "w", encoding="utf-8", newline="") as f:
-        f.write("\t".join(FEC_COLS) + "\r\n")
+        sep = "|" if separateur == "pipe" else "\t"
+        f.write(sep.join(FEC_COLS) + "\r\n")
         for e in ecritures:
             dd = e["date"].strftime("%Y%m%d")
-            f.write("\t".join([jc, jl, str(e["num"]), dd, e["compte"], e["libc"], e["aux"], e["auxl"],
+            f.write(sep.join([jc, jl, str(e["num"]), dd, e["compte"], e["libc"], e["aux"], e["auxl"],
                                e["piece"], dd, e["lib"], fmt(e["debit"]), fmt(e["credit"]),
                                "", "", dd, "", ""]) + "\r\n")
     return nom, d_tot
 
+def creer_archive(ecritures, fec, sources, type_, comptes=None):
+    """Zip : FEC + dossier pieces_jointes (1 fichier par facture, nommé JOURNAL_NUMECRITURE_REFPIECE) + index."""
+    jc = (comptes or COMPTES)[type_]["journal"][0]
+    factures = OrderedDict()
+    for e in ecritures: factures.setdefault(e["num"], e)
+    tmp, index, pieces = tempfile.mkdtemp(), [], []
+    for num, e in factures.items():
+        src = sources.get(e.get("src", ""))
+        ext = os.path.splitext(src)[1].lower() if src else ""
+        if not src or ext not in (".pdf", ".png", ".jpg", ".jpeg", ".xml"): continue
+        ref = re.sub(r"[^A-Za-z0-9._-]+", "_", e["piece"] or f"ecr{num}")[:40]
+        nom = f"{jc}_{num:05d}_{ref}{ext}"
+        chemin = os.path.join(tmp, nom)
+        if ext == ".pdf" and e.get("page"):
+            from pypdf import PdfReader, PdfWriter
+            w = PdfWriter(); w.add_page(PdfReader(src).pages[int(e["page"]) - 1])
+            with open(chemin, "wb") as fh: w.write(fh)
+        else:
+            shutil.copyfile(src, chemin)
+        pieces.append((nom, chemin))
+        index.append([jc, num, e["piece"], e["date"].strftime("%Y%m%d"), e["aux"],
+                      e["src"] + (f" p.{e['page']}" if e.get("page") else ""), nom])
+    if not pieces: return None
+    idx = os.path.join(tmp, "index_pieces.csv")
+    pd.DataFrame(index, columns=["JournalCode", "EcritureNum", "PieceRef", "EcritureDate", "CompAuxNum",
+                                 "Fichier source", "Pièce jointe"]).to_csv(idx, index=False, sep=";")
+    lisez = os.path.join(tmp, "LISEZMOI.txt")
+    open(lisez, "w", encoding="utf-8").write(
+        "Contenu : le FEC, le dossier pieces_jointes et index_pieces.csv.\n"
+        "Chaque pièce porte le nom JOURNAL_NUMEROECRITURE_REFERENCE : le numéro d'écriture est celui de la colonne "
+        "EcritureNum du FEC. index_pieces.csv fait le lien écriture <-> pièce.\n"
+        "Le FEC lui-même ne peut pas contenir de pièce jointe : le rattachement dans le logiciel comptable "
+        "dépend de ses fonctions d'import.\n")
+    zip_path = os.path.splitext(fec)[0] + "_avec_pieces.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(fec, os.path.basename(fec))
+        for nom, chemin in pieces: z.write(chemin, f"pieces_jointes/{nom}")
+        z.write(idx, "index_pieces.csv"); z.write(lisez, "LISEZMOI.txt")
+    return zip_path
+
 def traiter(fichiers, type_="vente", siren="000000000", exercice="", sortie=".", regles=None,
-            mappings=None, comptes=None, tva_comptes=None):
+            mappings=None, comptes=None, tva_comptes=None, separateur="tab"):
     anomalies, lignes = [], []
     for f in fichiers:
         nom = os.path.basename(f)
@@ -906,13 +951,14 @@ def traiter(fichiers, type_="vente", siren="000000000", exercice="", sortie=".",
     ecr = construire_ecritures(lignes, type_, anomalies,
                                preparer_regles(regles if regles is not None else charger_imputations()),
                                comptes, tva_comptes)
-    fec, total = ecrire_fec(ecr, type_, siren, exercice, sortie, comptes)
+    fec, total = ecrire_fec(ecr, type_, siren, exercice, sortie, comptes, separateur)
+    archive = creer_archive(ecr, fec, {os.path.basename(f): f for f in fichiers}, type_, comptes)
     rapport = None
     if anomalies:
         rapport = os.path.join(sortie, "rapport_anomalies.csv")
         pd.DataFrame(anomalies, columns=["ligne_source", "anomalie", "detail"]).to_csv(rapport, index=False, sep=";")
     sans = sorted({a[2] for a in anomalies if a[1].startswith("Aucune règle d'imputation")})
-    return dict(fec=fec, ecritures=ecr, anomalies=anomalies, rapport=rapport, total=total, sans_regle=sans)
+    return dict(fec=fec, zip=archive, ecritures=ecr, anomalies=anomalies, rapport=rapport, total=total, sans_regle=sans)
 
 def main():
     p = argparse.ArgumentParser()
@@ -920,12 +966,14 @@ def main():
     p.add_argument("--exercice", default=""); p.add_argument("--type", choices=["vente", "achat"], default="vente")
     p.add_argument("--sortie", default=".")
     p.add_argument("--imputations", default="imputations.csv")
+    p.add_argument("--separateur", choices=["tab", "pipe"], default="tab")
     a = p.parse_args()
     try:
-        r = traiter(a.fichiers, a.type, a.siren, a.exercice, a.sortie, charger_imputations(a.imputations))
+        r = traiter(a.fichiers, a.type, a.siren, a.exercice, a.sortie, charger_imputations(a.imputations), separateur=a.separateur)
     except ValueError as e:
         sys.exit(str(e))
     print(f"FEC généré : {r['fec']}  ({len(r['ecritures'])} lignes, débit = crédit = {r['total']})")
+    if r["zip"]: print(f"FEC + pièces jointes : {r['zip']}")
     if r["sans_regle"]: print("Sans règle d'imputation (à ajouter dans imputations.csv) : " + ", ".join(r["sans_regle"]))
     print(f"{len(r['anomalies'])} anomalie(s) : {r['rapport']}" if r["anomalies"] else "Aucune anomalie.")
 
