@@ -105,9 +105,34 @@ def mapping_ia(df, deja):
     except Exception as e:
         print(f"[IA indisponible : {e}]", file=sys.stderr); return {}
 
+CHAMPS_LIBELLES = {"date": "Date de facture", "numero": "N° de facture", "tiers": "Client / Fournisseur",
+                   "code_tiers": "Code tiers (facultatif)", "ht": "Montant HT", "tva": "Montant TVA",
+                   "ttc": "Montant TTC", "taux_tva": "Taux de TVA", "libelle": "Libellé (facultatif)",
+                   "compte": "Compte comptable (facultatif)"}
+
+def empreinte(df):
+    return hashlib.md5("|".join(map(str, df.columns)).encode()).hexdigest()[:10]
+
+def sauver_mapping(df, m, dossier="mappings"):
+    os.makedirs(dossier, exist_ok=True)
+    json.dump(m, open(os.path.join(dossier, f"{empreinte(df)}.json"), "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+
+def exporter_reglages(comptes, tva_comptes, dossier="mappings"):
+    """Tout ce qui se règle dans l'app, dans un dictionnaire sauvegardable (JSON)."""
+    maps = {}
+    if os.path.isdir(dossier):
+        for f in os.listdir(dossier):
+            if f.endswith(".json"): maps[f[:-5]] = json.load(open(os.path.join(dossier, f), encoding="utf-8"))
+    return {"comptes": comptes, "tva_comptes": tva_comptes, "mappings": maps}
+
+def importer_reglages(d, dossier="mappings"):
+    os.makedirs(dossier, exist_ok=True)
+    for emp, m in (d.get("mappings") or {}).items():
+        json.dump(m, open(os.path.join(dossier, f"{emp}.json"), "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+    return d.get("comptes"), d.get("tva_comptes")
+
 def charger_mapping(df, dossier="mappings"):
-    empreinte = hashlib.md5("|".join(map(str, df.columns)).encode()).hexdigest()[:10]
-    chemin = os.path.join(dossier, f"{empreinte}.json")
+    chemin = os.path.join(dossier, f"{empreinte(df)}.json")
     if os.path.exists(chemin):
         print(f"Mapping mémorisé : {chemin}")
         return json.load(open(chemin, encoding="utf-8"))
@@ -694,37 +719,91 @@ def vers_pivot(df, m, anomalies, src=""):
     return lignes
 
 # ---------- Table d'imputation (fournisseur/client -> compte) ----------
-IMPUT_DEFAUT = [
-    ("edf", "606100", "Énergie - électricité"), ("engie", "606100", "Énergie - gaz"),
-    ("orange", "626000", "Frais postaux et télécommunications"), ("sfr", "626000", "Frais postaux et télécommunications"),
-    ("bouygues", "626000", "Frais postaux et télécommunications"), ("free", "626000", "Frais postaux et télécommunications"),
-    ("la poste", "626000", "Frais postaux et télécommunications"),
-    ("axa", "616000", "Primes d'assurance"), ("maif", "616000", "Primes d'assurance"),
-    ("allianz", "616000", "Primes d'assurance"), ("groupama", "616000", "Primes d'assurance"),
-    ("sncf", "625100", "Voyages et déplacements"), ("air france", "625100", "Voyages et déplacements"),
-]
+# Modèle de départ INDICATIF (plan comptable général) : à valider avec le plan de chaque dossier.
+_IMP = {
+    ("606100", "Fournitures non stockables (énergie, eau, carburant)"): [
+        "edf", "engie", "totalenergies", "total energies", "direct energie", "enedis", "grdf", "eni", "plenitude",
+        "ekwateur", "ilek", "mint energie", "veolia", "suez", "saur", "esso", "shell", "bp", "avia", "q8", "dkv"],
+    ("606300", "Fournitures d'entretien et petit équipement"): [
+        "leroy merlin", "castorama", "brico depot", "bricomarche", "ikea", "amazon", "amazon business", "fnac", "darty",
+        "boulanger", "cdiscount", "ldlc", "materiel net", "back market", "backmarket", "dell", "lenovo", "apple", "hp",
+        "carrefour", "auchan", "lidl", "leclerc", "intermarche", "gifi"],
+    ("606400", "Fournitures administratives"): [
+        "bureau vallee", "staples", "office depot", "lyreco", "manutan", "viking", "majuscule", "rajapack"],
+    ("613200", "Locations immobilières"): ["foncia", "nexity", "citya", "regus", "wework"],
+    ("613500", "Locations mobilières et abonnements logiciels"): [
+        "hertz", "avis", "europcar", "ada", "rent a car", "leasys", "ayvens", "ald automotive", "leaseplan", "loxam",
+        "kiloutou", "boels", "elis",
+        "google workspace", "google cloud", "google", "microsoft", "adobe", "ovh", "ovhcloud", "gandi", "ionos", "o2switch",
+        "scaleway", "digitalocean", "amazon web services", "aws", "slack", "zoom", "notion", "canva", "dropbox", "github",
+        "gitlab", "shopify", "wix", "squarespace", "mailchimp", "brevo", "sendinblue", "hubspot", "salesforce", "openai",
+        "anthropic", "atlassian", "figma", "airtable", "zapier", "docusign", "yousign", "pennylane", "tiime", "indy",
+        "freebe", "henrri", "axonaut", "sellsy", "zervant", "quickbooks", "xero", "cegid", "sage", "ebp", "acd"],
+    ("615000", "Entretien et réparations"): [
+        "norauto", "speedy", "midas", "feu vert", "euromaster", "point s", "vulco", "carglass", "onet"],
+    ("616000", "Primes d'assurance"): [
+        "axa", "maif", "macif", "matmut", "allianz", "groupama", "generali", "hiscox", "april", "swisslife", "mma", "gan",
+        "aviva", "ag2r", "malakoff humanis", "harmonie mutuelle", "covea", "pacifica", "direct assurance", "euler hermes"],
+    ("618100", "Documentation générale"): [
+        "lefebvre dalloz", "dalloz", "editions legislatives", "wolters kluwer", "les echos", "le monde", "le figaro"],
+    ("618400", "Versements à des organismes de formation"): ["cegos", "ifocop", "openclassrooms", "udemy", "coursera", "linkedin learning"],
+    ("622600", "Honoraires"): [
+        "expert comptable", "expertise comptable", "commissaire aux comptes", "avocat", "avocats", "notaire",
+        "legalstart", "legalplace", "captain contrat"],
+    ("622700", "Frais d'actes et de contentieux"): ["huissier", "infogreffe", "greffe", "inpi"],
+    ("623000", "Publicité, annonces et recrutement"): [
+        "google ads", "facebook", "meta platforms", "instagram", "linkedin", "pages jaunes", "solocal", "vistaprint",
+        "tiktok", "pinterest", "indeed", "welcome to the jungle", "apec", "pole emploi", "france travail"],
+    ("624100", "Transports (colis et expéditions)"): [
+        "colissimo", "chronopost", "dhl", "ups", "fedex", "tnt", "dpd", "gls", "mondial relay", "relais colis", "boxtal",
+        "sendcloud", "packlink", "geodis", "schenker", "heppner"],
+    ("625100", "Voyages, déplacements, péages et parkings"): [
+        "sncf", "ouigo", "air france", "easyjet", "ryanair", "transavia", "blablacar", "uber", "bolt", "g7", "ratp",
+        "navigo", "flixbus", "eurostar", "booking", "airbnb", "ibis", "accor", "novotel", "mercure", "campanile",
+        "kyriad", "vinci autoroutes", "sanef", "aprr", "escota", "cofiroute", "sapn", "indigo", "saemes", "onepark",
+        "zenpark", "q park", "effia"],
+    ("625700", "Réceptions"): ["uber eats", "deliveroo", "just eat", "mcdonald", "restaurant", "traiteur"],
+    ("626000", "Frais postaux et télécommunications"): [
+        "orange", "sfr", "bouygues", "free", "free mobile", "la poste", "ringover", "aircall", "onoff", "wifirst", "lebara",
+        "sosh", "red by sfr", "numericable", "nordnet"],
+    ("627000", "Services bancaires et assimilés"): [
+        "qonto", "shine", "bnp paribas", "societe generale", "credit agricole", "caisse d epargne", "lcl", "credit mutuel",
+        "cic", "banque populaire", "la banque postale", "boursorama", "revolut", "stripe", "paypal", "sumup", "zettle",
+        "alma", "mollie", "adyen", "gocardless", "hello bank", "fortuneo", "bred", "hsbc", "n26"],
+    ("628100", "Cotisations"): ["cci", "chambre de commerce", "chambre des metiers", "capeb", "ffb", "medef", "cpme"],
+    ("628800", "Autres services extérieurs (sécurité, surveillance)"): ["securitas", "verisure", "prosegur"],
+}
+IMPUT_DEFAUT = sorted([(m, c, lib, "achat") for (c, lib), ms in _IMP.items() for m in ms], key=lambda r: (r[1], r[0]))
+COLS_IMPUT = ["motif", "compte", "libelle", "type"]
 
 def charger_imputations(chemin="imputations.csv"):
-    """Table motif;compte;libelle. Un modèle de départ est créé si le fichier n'existe pas."""
+    """Table motif;compte;libelle;type (type = achat, vente ou vide pour les deux)."""
     if not os.path.exists(chemin):
-        pd.DataFrame(IMPUT_DEFAUT, columns=["motif", "compte", "libelle"]).to_csv(chemin, index=False, sep=";")
+        pd.DataFrame(IMPUT_DEFAUT, columns=COLS_IMPUT).to_csv(chemin, index=False, sep=";")
     df = pd.read_csv(chemin, sep=";", dtype=str).fillna("")
-    for c in ("motif", "compte", "libelle"):
+    for c in COLS_IMPUT:
         if c not in df.columns: df[c] = ""
-    return df[["motif", "compte", "libelle"]]
+    return df[COLS_IMPUT]
+
+def fusionner_modele(df):
+    """Ajoute à la table les règles du modèle dont le motif n'y figure pas encore (ne modifie rien d'existant)."""
+    connus = {norm(m) for m in df["motif"]}
+    neuf = [r for r in IMPUT_DEFAUT if norm(r[0]) not in connus]
+    return pd.concat([df, pd.DataFrame(neuf, columns=COLS_IMPUT)], ignore_index=True), len(neuf)
 
 def _s(v):
     return "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v).strip()
 
 def preparer_regles(regles):
-    out = [(norm(_s(r["motif"])), _s(r["compte"]), _s(r["libelle"])) for _, r in regles.iterrows()]
+    out = [(norm(_s(r["motif"])), _s(r["compte"]), _s(r["libelle"]), norm(_s(r.get("type", "")))) for _, r in regles.iterrows()]
     return sorted([r for r in out if r[0] and r[1]], key=lambda r: -len(r[0]))  # motif le plus précis d'abord
 
-def trouver_regle(tiers, regles):
+def trouver_regle(tiers, regles, type_=None):
     n = norm(tiers)
-    for motif, compte, lib in regles:
-        if re.search(rf"(?<![a-z0-9]){re.escape(motif)}(?![a-z0-9])", n):
-            return compte, lib
+    for motif, compte, lib, typ in regles:
+        if typ in ("", "tous", "nan") or type_ is None or typ == type_:
+            if re.search(rf"(?<![a-z0-9]){re.escape(motif)}(?![a-z0-9])", n):
+                return compte, lib
     return None
 
 # ---------- Contrôles + écritures ----------
@@ -733,8 +812,9 @@ def aux_code(l, prefixe):
     base = re.sub(r"[^A-Z0-9]", "", norm(l["tiers"]).upper())[:8]
     return ("F" if prefixe == "401" else "C") + base if base else "DIVERS"
 
-def construire_ecritures(lignes, type_, anomalies, regles=None):
-    cfg = COMPTES[type_]
+def construire_ecritures(lignes, type_, anomalies, regles=None, comptes=None, tva_comptes=None):
+    cfg = (comptes or COMPTES)[type_]
+    tvac = tva_comptes or TVA_COMPTES
     regles, signales = regles or [], set()
     factures = OrderedDict()
     for l in lignes:
@@ -756,7 +836,7 @@ def construire_ecritures(lignes, type_, anomalies, regles=None):
            and not (len(ls) > 1 and abs(ttcs[0] - ttc_calc) <= Decimal("0.02")):
             anomalies.append((ls[0]["n"], f"HT+TVA ({ttc_calc}) <> TTC ({ttc_src})", numero))
         for t in tva_par_taux:
-            if t not in TVA_COMPTES and t not in ("0", "0.0"):
+            if t not in tvac and t not in ("0", "0.0"):
                 anomalies.append((ls[0]["n"], f"Taux de TVA inhabituel : {t}%", numero))
         avoir = ttc_calc < 0
         num += 1
@@ -773,7 +853,7 @@ def construire_ecritures(lignes, type_, anomalies, regles=None):
         for x in ls:
             cpt, libc = x["compte"], cfg["libelle_cp"]
             if not cpt:
-                reg = trouver_regle(tiers, regles)
+                reg = trouver_regle(tiers, regles, type_)
                 if reg: cpt, libc = reg[0], (reg[1] or libc)
                 else:
                     cpt = cfg["charge_produit"]
@@ -782,7 +862,7 @@ def construire_ecritures(lignes, type_, anomalies, regles=None):
                         anomalies.append((x["n"], f"Aucune règle d'imputation : compte par défaut {cpt}", tiers))
             ecr(cpt, libc, "", "", x["ht"], sc)
         for t, v in tva_par_taux.items():
-            cpt = TVA_COMPTES.get(t, ("44571000", "44566000"))[idx]
+            cpt = tvac.get(t, ("44571000", "44566000"))[idx]
             ecr(cpt, TVA_LIB, "", "", v, sc)
     return ecritures
 
@@ -791,8 +871,8 @@ FEC_COLS = ["JournalCode","JournalLib","EcritureNum","EcritureDate","CompteNum",
             "CompAuxLib","PieceRef","PieceDate","EcritureLib","Debit","Credit","EcritureLet","DateLet",
             "ValidDate","Montantdevise","Idevise"]
 
-def ecrire_fec(ecritures, type_, siren, exercice, sortie):
-    jc, jl = COMPTES[type_]["journal"]
+def ecrire_fec(ecritures, type_, siren, exercice, sortie, comptes=None):
+    jc, jl = (comptes or COMPTES)[type_]["journal"]
     fmt = lambda x: f"{x:.2f}".replace(".", ",")
     d_tot = sum(e["debit"] for e in ecritures); c_tot = sum(e["credit"] for e in ecritures)
     if d_tot != c_tot: raise ValueError(f"FEC déséquilibré : D={d_tot} C={c_tot}")
@@ -807,7 +887,8 @@ def ecrire_fec(ecritures, type_, siren, exercice, sortie):
                                "", "", dd, "", ""]) + "\r\n")
     return nom, d_tot
 
-def traiter(fichiers, type_="vente", siren="000000000", exercice="", sortie=".", regles=None):
+def traiter(fichiers, type_="vente", siren="000000000", exercice="", sortie=".", regles=None,
+            mappings=None, comptes=None, tva_comptes=None):
     anomalies, lignes = [], []
     for f in fichiers:
         nom = os.path.basename(f)
@@ -818,12 +899,13 @@ def traiter(fichiers, type_="vente", siren="000000000", exercice="", sortie=".",
         anomalies += [(nom, a, b) for a, b in df.attrs.get("anomalies", [])]
         if df.empty:
             anomalies.append((nom, "Aucune facture extraite", "")); continue
-        lignes += vers_pivot(df, charger_mapping(df), anomalies, nom)
+        lignes += vers_pivot(df, (mappings or {}).get(nom) or charger_mapping(df), anomalies, nom)
     if not lignes:
         raise ValueError("Aucune écriture exploitable : " + " ; ".join(f"{a[0]} - {a[1]}" for a in anomalies[:3]))
     ecr = construire_ecritures(lignes, type_, anomalies,
-                               preparer_regles(regles if regles is not None else charger_imputations()))
-    fec, total = ecrire_fec(ecr, type_, siren, exercice, sortie)
+                               preparer_regles(regles if regles is not None else charger_imputations()),
+                               comptes, tva_comptes)
+    fec, total = ecrire_fec(ecr, type_, siren, exercice, sortie, comptes)
     rapport = None
     if anomalies:
         rapport = os.path.join(sortie, "rapport_anomalies.csv")

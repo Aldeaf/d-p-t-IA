@@ -1,14 +1,301 @@
-motif;compte;libelle
-edf;606100;Énergie - électricité
-engie;606100;Énergie - gaz
-orange;626000;Frais postaux et télécommunications
-sfr;626000;Frais postaux et télécommunications
-bouygues;626000;Frais postaux et télécommunications
-free;626000;Frais postaux et télécommunications
-la poste;626000;Frais postaux et télécommunications
-axa;616000;Primes d'assurance
-maif;616000;Primes d'assurance
-allianz;616000;Primes d'assurance
-groupama;616000;Primes d'assurance
-sncf;625100;Voyages et déplacements
-air france;625100;Voyages et déplacements
+motif;compte;libelle;type
+avia;606100;Fournitures non stockables (énergie, eau, carburant);achat
+bp;606100;Fournitures non stockables (énergie, eau, carburant);achat
+direct energie;606100;Fournitures non stockables (énergie, eau, carburant);achat
+dkv;606100;Fournitures non stockables (énergie, eau, carburant);achat
+edf;606100;Fournitures non stockables (énergie, eau, carburant);achat
+ekwateur;606100;Fournitures non stockables (énergie, eau, carburant);achat
+enedis;606100;Fournitures non stockables (énergie, eau, carburant);achat
+engie;606100;Fournitures non stockables (énergie, eau, carburant);achat
+eni;606100;Fournitures non stockables (énergie, eau, carburant);achat
+esso;606100;Fournitures non stockables (énergie, eau, carburant);achat
+grdf;606100;Fournitures non stockables (énergie, eau, carburant);achat
+ilek;606100;Fournitures non stockables (énergie, eau, carburant);achat
+mint energie;606100;Fournitures non stockables (énergie, eau, carburant);achat
+plenitude;606100;Fournitures non stockables (énergie, eau, carburant);achat
+q8;606100;Fournitures non stockables (énergie, eau, carburant);achat
+saur;606100;Fournitures non stockables (énergie, eau, carburant);achat
+shell;606100;Fournitures non stockables (énergie, eau, carburant);achat
+suez;606100;Fournitures non stockables (énergie, eau, carburant);achat
+total energies;606100;Fournitures non stockables (énergie, eau, carburant);achat
+totalenergies;606100;Fournitures non stockables (énergie, eau, carburant);achat
+veolia;606100;Fournitures non stockables (énergie, eau, carburant);achat
+amazon;606300;Fournitures d'entretien et petit équipement;achat
+amazon business;606300;Fournitures d'entretien et petit équipement;achat
+apple;606300;Fournitures d'entretien et petit équipement;achat
+auchan;606300;Fournitures d'entretien et petit équipement;achat
+back market;606300;Fournitures d'entretien et petit équipement;achat
+backmarket;606300;Fournitures d'entretien et petit équipement;achat
+boulanger;606300;Fournitures d'entretien et petit équipement;achat
+brico depot;606300;Fournitures d'entretien et petit équipement;achat
+bricomarche;606300;Fournitures d'entretien et petit équipement;achat
+carrefour;606300;Fournitures d'entretien et petit équipement;achat
+castorama;606300;Fournitures d'entretien et petit équipement;achat
+cdiscount;606300;Fournitures d'entretien et petit équipement;achat
+darty;606300;Fournitures d'entretien et petit équipement;achat
+dell;606300;Fournitures d'entretien et petit équipement;achat
+fnac;606300;Fournitures d'entretien et petit équipement;achat
+gifi;606300;Fournitures d'entretien et petit équipement;achat
+hp;606300;Fournitures d'entretien et petit équipement;achat
+ikea;606300;Fournitures d'entretien et petit équipement;achat
+intermarche;606300;Fournitures d'entretien et petit équipement;achat
+ldlc;606300;Fournitures d'entretien et petit équipement;achat
+leclerc;606300;Fournitures d'entretien et petit équipement;achat
+lenovo;606300;Fournitures d'entretien et petit équipement;achat
+leroy merlin;606300;Fournitures d'entretien et petit équipement;achat
+lidl;606300;Fournitures d'entretien et petit équipement;achat
+materiel net;606300;Fournitures d'entretien et petit équipement;achat
+bureau vallee;606400;Fournitures administratives;achat
+lyreco;606400;Fournitures administratives;achat
+majuscule;606400;Fournitures administratives;achat
+manutan;606400;Fournitures administratives;achat
+office depot;606400;Fournitures administratives;achat
+rajapack;606400;Fournitures administratives;achat
+staples;606400;Fournitures administratives;achat
+viking;606400;Fournitures administratives;achat
+citya;613200;Locations immobilières;achat
+foncia;613200;Locations immobilières;achat
+nexity;613200;Locations immobilières;achat
+regus;613200;Locations immobilières;achat
+wework;613200;Locations immobilières;achat
+acd;613500;Locations mobilières et abonnements logiciels;achat
+ada;613500;Locations mobilières et abonnements logiciels;achat
+adobe;613500;Locations mobilières et abonnements logiciels;achat
+airtable;613500;Locations mobilières et abonnements logiciels;achat
+ald automotive;613500;Locations mobilières et abonnements logiciels;achat
+amazon web services;613500;Locations mobilières et abonnements logiciels;achat
+anthropic;613500;Locations mobilières et abonnements logiciels;achat
+atlassian;613500;Locations mobilières et abonnements logiciels;achat
+avis;613500;Locations mobilières et abonnements logiciels;achat
+aws;613500;Locations mobilières et abonnements logiciels;achat
+axonaut;613500;Locations mobilières et abonnements logiciels;achat
+ayvens;613500;Locations mobilières et abonnements logiciels;achat
+boels;613500;Locations mobilières et abonnements logiciels;achat
+brevo;613500;Locations mobilières et abonnements logiciels;achat
+canva;613500;Locations mobilières et abonnements logiciels;achat
+cegid;613500;Locations mobilières et abonnements logiciels;achat
+digitalocean;613500;Locations mobilières et abonnements logiciels;achat
+docusign;613500;Locations mobilières et abonnements logiciels;achat
+dropbox;613500;Locations mobilières et abonnements logiciels;achat
+ebp;613500;Locations mobilières et abonnements logiciels;achat
+elis;613500;Locations mobilières et abonnements logiciels;achat
+europcar;613500;Locations mobilières et abonnements logiciels;achat
+figma;613500;Locations mobilières et abonnements logiciels;achat
+freebe;613500;Locations mobilières et abonnements logiciels;achat
+gandi;613500;Locations mobilières et abonnements logiciels;achat
+github;613500;Locations mobilières et abonnements logiciels;achat
+gitlab;613500;Locations mobilières et abonnements logiciels;achat
+google;613500;Locations mobilières et abonnements logiciels;achat
+google cloud;613500;Locations mobilières et abonnements logiciels;achat
+google workspace;613500;Locations mobilières et abonnements logiciels;achat
+henrri;613500;Locations mobilières et abonnements logiciels;achat
+hertz;613500;Locations mobilières et abonnements logiciels;achat
+hubspot;613500;Locations mobilières et abonnements logiciels;achat
+indy;613500;Locations mobilières et abonnements logiciels;achat
+ionos;613500;Locations mobilières et abonnements logiciels;achat
+kiloutou;613500;Locations mobilières et abonnements logiciels;achat
+leaseplan;613500;Locations mobilières et abonnements logiciels;achat
+leasys;613500;Locations mobilières et abonnements logiciels;achat
+loxam;613500;Locations mobilières et abonnements logiciels;achat
+mailchimp;613500;Locations mobilières et abonnements logiciels;achat
+microsoft;613500;Locations mobilières et abonnements logiciels;achat
+notion;613500;Locations mobilières et abonnements logiciels;achat
+o2switch;613500;Locations mobilières et abonnements logiciels;achat
+openai;613500;Locations mobilières et abonnements logiciels;achat
+ovh;613500;Locations mobilières et abonnements logiciels;achat
+ovhcloud;613500;Locations mobilières et abonnements logiciels;achat
+pennylane;613500;Locations mobilières et abonnements logiciels;achat
+quickbooks;613500;Locations mobilières et abonnements logiciels;achat
+rent a car;613500;Locations mobilières et abonnements logiciels;achat
+sage;613500;Locations mobilières et abonnements logiciels;achat
+salesforce;613500;Locations mobilières et abonnements logiciels;achat
+scaleway;613500;Locations mobilières et abonnements logiciels;achat
+sellsy;613500;Locations mobilières et abonnements logiciels;achat
+sendinblue;613500;Locations mobilières et abonnements logiciels;achat
+shopify;613500;Locations mobilières et abonnements logiciels;achat
+slack;613500;Locations mobilières et abonnements logiciels;achat
+squarespace;613500;Locations mobilières et abonnements logiciels;achat
+tiime;613500;Locations mobilières et abonnements logiciels;achat
+wix;613500;Locations mobilières et abonnements logiciels;achat
+xero;613500;Locations mobilières et abonnements logiciels;achat
+yousign;613500;Locations mobilières et abonnements logiciels;achat
+zapier;613500;Locations mobilières et abonnements logiciels;achat
+zervant;613500;Locations mobilières et abonnements logiciels;achat
+zoom;613500;Locations mobilières et abonnements logiciels;achat
+carglass;615000;Entretien et réparations;achat
+euromaster;615000;Entretien et réparations;achat
+feu vert;615000;Entretien et réparations;achat
+midas;615000;Entretien et réparations;achat
+norauto;615000;Entretien et réparations;achat
+onet;615000;Entretien et réparations;achat
+point s;615000;Entretien et réparations;achat
+speedy;615000;Entretien et réparations;achat
+vulco;615000;Entretien et réparations;achat
+ag2r;616000;Primes d'assurance;achat
+allianz;616000;Primes d'assurance;achat
+april;616000;Primes d'assurance;achat
+aviva;616000;Primes d'assurance;achat
+axa;616000;Primes d'assurance;achat
+covea;616000;Primes d'assurance;achat
+direct assurance;616000;Primes d'assurance;achat
+euler hermes;616000;Primes d'assurance;achat
+gan;616000;Primes d'assurance;achat
+generali;616000;Primes d'assurance;achat
+groupama;616000;Primes d'assurance;achat
+harmonie mutuelle;616000;Primes d'assurance;achat
+hiscox;616000;Primes d'assurance;achat
+macif;616000;Primes d'assurance;achat
+maif;616000;Primes d'assurance;achat
+malakoff humanis;616000;Primes d'assurance;achat
+matmut;616000;Primes d'assurance;achat
+mma;616000;Primes d'assurance;achat
+pacifica;616000;Primes d'assurance;achat
+swisslife;616000;Primes d'assurance;achat
+dalloz;618100;Documentation générale;achat
+editions legislatives;618100;Documentation générale;achat
+le figaro;618100;Documentation générale;achat
+le monde;618100;Documentation générale;achat
+lefebvre dalloz;618100;Documentation générale;achat
+les echos;618100;Documentation générale;achat
+wolters kluwer;618100;Documentation générale;achat
+cegos;618400;Versements à des organismes de formation;achat
+coursera;618400;Versements à des organismes de formation;achat
+ifocop;618400;Versements à des organismes de formation;achat
+linkedin learning;618400;Versements à des organismes de formation;achat
+openclassrooms;618400;Versements à des organismes de formation;achat
+udemy;618400;Versements à des organismes de formation;achat
+avocat;622600;Honoraires;achat
+avocats;622600;Honoraires;achat
+captain contrat;622600;Honoraires;achat
+commissaire aux comptes;622600;Honoraires;achat
+expert comptable;622600;Honoraires;achat
+expertise comptable;622600;Honoraires;achat
+legalplace;622600;Honoraires;achat
+legalstart;622600;Honoraires;achat
+notaire;622600;Honoraires;achat
+greffe;622700;Frais d'actes et de contentieux;achat
+huissier;622700;Frais d'actes et de contentieux;achat
+infogreffe;622700;Frais d'actes et de contentieux;achat
+inpi;622700;Frais d'actes et de contentieux;achat
+apec;623000;Publicité, annonces et recrutement;achat
+facebook;623000;Publicité, annonces et recrutement;achat
+france travail;623000;Publicité, annonces et recrutement;achat
+google ads;623000;Publicité, annonces et recrutement;achat
+indeed;623000;Publicité, annonces et recrutement;achat
+instagram;623000;Publicité, annonces et recrutement;achat
+linkedin;623000;Publicité, annonces et recrutement;achat
+meta platforms;623000;Publicité, annonces et recrutement;achat
+pages jaunes;623000;Publicité, annonces et recrutement;achat
+pinterest;623000;Publicité, annonces et recrutement;achat
+pole emploi;623000;Publicité, annonces et recrutement;achat
+solocal;623000;Publicité, annonces et recrutement;achat
+tiktok;623000;Publicité, annonces et recrutement;achat
+vistaprint;623000;Publicité, annonces et recrutement;achat
+welcome to the jungle;623000;Publicité, annonces et recrutement;achat
+boxtal;624100;Transports (colis et expéditions);achat
+chronopost;624100;Transports (colis et expéditions);achat
+colissimo;624100;Transports (colis et expéditions);achat
+dhl;624100;Transports (colis et expéditions);achat
+dpd;624100;Transports (colis et expéditions);achat
+fedex;624100;Transports (colis et expéditions);achat
+geodis;624100;Transports (colis et expéditions);achat
+gls;624100;Transports (colis et expéditions);achat
+heppner;624100;Transports (colis et expéditions);achat
+mondial relay;624100;Transports (colis et expéditions);achat
+packlink;624100;Transports (colis et expéditions);achat
+relais colis;624100;Transports (colis et expéditions);achat
+schenker;624100;Transports (colis et expéditions);achat
+sendcloud;624100;Transports (colis et expéditions);achat
+tnt;624100;Transports (colis et expéditions);achat
+ups;624100;Transports (colis et expéditions);achat
+accor;625100;Voyages, déplacements, péages et parkings;achat
+air france;625100;Voyages, déplacements, péages et parkings;achat
+airbnb;625100;Voyages, déplacements, péages et parkings;achat
+aprr;625100;Voyages, déplacements, péages et parkings;achat
+blablacar;625100;Voyages, déplacements, péages et parkings;achat
+bolt;625100;Voyages, déplacements, péages et parkings;achat
+booking;625100;Voyages, déplacements, péages et parkings;achat
+campanile;625100;Voyages, déplacements, péages et parkings;achat
+cofiroute;625100;Voyages, déplacements, péages et parkings;achat
+easyjet;625100;Voyages, déplacements, péages et parkings;achat
+effia;625100;Voyages, déplacements, péages et parkings;achat
+escota;625100;Voyages, déplacements, péages et parkings;achat
+eurostar;625100;Voyages, déplacements, péages et parkings;achat
+flixbus;625100;Voyages, déplacements, péages et parkings;achat
+g7;625100;Voyages, déplacements, péages et parkings;achat
+ibis;625100;Voyages, déplacements, péages et parkings;achat
+indigo;625100;Voyages, déplacements, péages et parkings;achat
+kyriad;625100;Voyages, déplacements, péages et parkings;achat
+mercure;625100;Voyages, déplacements, péages et parkings;achat
+navigo;625100;Voyages, déplacements, péages et parkings;achat
+novotel;625100;Voyages, déplacements, péages et parkings;achat
+onepark;625100;Voyages, déplacements, péages et parkings;achat
+ouigo;625100;Voyages, déplacements, péages et parkings;achat
+q park;625100;Voyages, déplacements, péages et parkings;achat
+ratp;625100;Voyages, déplacements, péages et parkings;achat
+ryanair;625100;Voyages, déplacements, péages et parkings;achat
+saemes;625100;Voyages, déplacements, péages et parkings;achat
+sanef;625100;Voyages, déplacements, péages et parkings;achat
+sapn;625100;Voyages, déplacements, péages et parkings;achat
+sncf;625100;Voyages, déplacements, péages et parkings;achat
+transavia;625100;Voyages, déplacements, péages et parkings;achat
+uber;625100;Voyages, déplacements, péages et parkings;achat
+vinci autoroutes;625100;Voyages, déplacements, péages et parkings;achat
+zenpark;625100;Voyages, déplacements, péages et parkings;achat
+deliveroo;625700;Réceptions;achat
+just eat;625700;Réceptions;achat
+mcdonald;625700;Réceptions;achat
+restaurant;625700;Réceptions;achat
+traiteur;625700;Réceptions;achat
+uber eats;625700;Réceptions;achat
+aircall;626000;Frais postaux et télécommunications;achat
+bouygues;626000;Frais postaux et télécommunications;achat
+free;626000;Frais postaux et télécommunications;achat
+free mobile;626000;Frais postaux et télécommunications;achat
+la poste;626000;Frais postaux et télécommunications;achat
+lebara;626000;Frais postaux et télécommunications;achat
+nordnet;626000;Frais postaux et télécommunications;achat
+numericable;626000;Frais postaux et télécommunications;achat
+onoff;626000;Frais postaux et télécommunications;achat
+orange;626000;Frais postaux et télécommunications;achat
+red by sfr;626000;Frais postaux et télécommunications;achat
+ringover;626000;Frais postaux et télécommunications;achat
+sfr;626000;Frais postaux et télécommunications;achat
+sosh;626000;Frais postaux et télécommunications;achat
+wifirst;626000;Frais postaux et télécommunications;achat
+adyen;627000;Services bancaires et assimilés;achat
+alma;627000;Services bancaires et assimilés;achat
+banque populaire;627000;Services bancaires et assimilés;achat
+bnp paribas;627000;Services bancaires et assimilés;achat
+boursorama;627000;Services bancaires et assimilés;achat
+bred;627000;Services bancaires et assimilés;achat
+caisse d epargne;627000;Services bancaires et assimilés;achat
+cic;627000;Services bancaires et assimilés;achat
+credit agricole;627000;Services bancaires et assimilés;achat
+credit mutuel;627000;Services bancaires et assimilés;achat
+fortuneo;627000;Services bancaires et assimilés;achat
+gocardless;627000;Services bancaires et assimilés;achat
+hello bank;627000;Services bancaires et assimilés;achat
+hsbc;627000;Services bancaires et assimilés;achat
+la banque postale;627000;Services bancaires et assimilés;achat
+lcl;627000;Services bancaires et assimilés;achat
+mollie;627000;Services bancaires et assimilés;achat
+n26;627000;Services bancaires et assimilés;achat
+paypal;627000;Services bancaires et assimilés;achat
+qonto;627000;Services bancaires et assimilés;achat
+revolut;627000;Services bancaires et assimilés;achat
+shine;627000;Services bancaires et assimilés;achat
+societe generale;627000;Services bancaires et assimilés;achat
+stripe;627000;Services bancaires et assimilés;achat
+sumup;627000;Services bancaires et assimilés;achat
+zettle;627000;Services bancaires et assimilés;achat
+capeb;628100;Cotisations;achat
+cci;628100;Cotisations;achat
+chambre de commerce;628100;Cotisations;achat
+chambre des metiers;628100;Cotisations;achat
+cpme;628100;Cotisations;achat
+ffb;628100;Cotisations;achat
+medef;628100;Cotisations;achat
+prosegur;628800;Autres services extérieurs (sécurité, surveillance);achat
+securitas;628800;Autres services extérieurs (sécurité, surveillance);achat
+verisure;628800;Autres services extérieurs (sécurité, surveillance);achat
