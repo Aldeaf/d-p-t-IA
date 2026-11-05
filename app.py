@@ -9,10 +9,13 @@ st.title("🧾 Factures → FEC pour ACD")
 st.caption("CSV/Excel : règles · PDF Factur-X : XML intégré · PDF texte : règles · Scans : OCR si installé, sinon IA (clé facultative)")
 ss = st.session_state
 
+LIBELLES = {"vente": "🧑‍💼 Clients (factures de vente)", "achat": "🏭 Fournisseurs (factures d'achat)"}
+type_ = st.radio("Je traite des…", list(LIBELLES), format_func=LIBELLES.get, horizontal=True)
+col1, col2 = st.columns(2)
+siren = col1.text_input("SIREN du dossier", "000000000")
+exercice = col2.text_input("Exercice (AAAA)", "2026")
+
 with st.sidebar:
-    type_ = st.radio("Type de factures", ["vente", "achat"], format_func=str.capitalize)
-    siren = st.text_input("SIREN du dossier", "000000000")
-    exercice = st.text_input("Exercice (AAAA)", "2026")
     cle = st.text_input("Clé API Anthropic (facultative, secours IA)", type="password")
     if cle:
         os.environ["ANTHROPIC_API_KEY"] = cle
@@ -41,9 +44,9 @@ def lancer():
         ss.res, ss.err = None, str(e)
 
 fichiers = st.file_uploader("Déposez vos exports ou factures", accept_multiple_files=True,
-                            type=["csv", "xlsx", "xls", "pdf", "png", "jpg", "jpeg"])
+                            type=["csv", "xlsx", "xls", "pdf", "xml", "png", "jpg", "jpeg"])
 
-if fichiers and st.button("Générer le FEC", type="primary"):
+if fichiers and st.button(f"Générer le FEC ({'clients' if type_ == 'vente' else 'fournisseurs'})", type="primary"):
     ss.tmp, ss.chemins = tempfile.mkdtemp(), []
     for f in fichiers:
         p = os.path.join(ss.tmp, f.name)

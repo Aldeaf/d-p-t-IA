@@ -37,7 +37,7 @@ SYNONYMES = {
              "date de piece", "date doc", "date document", "date comptable", "date de facturation", "date facturation",
              "invoice date", "issue date", "date of issue", "date creation", "date de creation", "created", "date"],
     "numero": ["numero facture", "numero de facture", "n facture", "n de facture", "no facture", "num facture", "n piece",
-               "numero piece", "n°","numero de piece", "n de piece", "reference facture", "ref facture", "invoice number",
+               "numero piece", "numero de piece", "n de piece", "reference facture", "ref facture", "invoice number",
                "invoice no", "invoice", "document", "numero", "reference", "ref", "num", "facture", "piece"],
     "tiers": ["client", "nom client", "nom du client", "raison sociale", "fournisseur", "nom fournisseur",
               "nom du fournisseur", "tiers", "nom tiers", "societe", "entreprise", "denomination", "customer",
@@ -360,9 +360,18 @@ MOTIFS_TTC = [r"total\s*" + DEV + r"(?:g[ée]n[ée]ral\s*)?t\.?t\.?c\.?", r"mont
               r"total\s*(?:incl(?:uding|\.)?\s*(?:vat|tax))", r"grand\s*total", r"gross\s*total", r"total\s*gross", r"total\s*amount", r"total\s*due",
               r"amount\s*due", r"net\s*[àa]\s*payer", r"total\s*[àa]\s*(?:payer|r[ée]gler)", r"[àa]\s*r[ée]gler",
               r"montant\s*total", r"total\s*g[ée]n[ée]ral"]
-MOTIFS_TVA = [r"total\s*t\.?v\.?a\.?", r"montant\s*(?:de\s*la\s*)?t\.?v\.?a\.?", r"total\s*(?:vat|tax(?:es)?)",
-              r"(?<![a-z])(?:t\.?v\.?a\.?|vat)\s*(?:\(?\d{1,2}(?:[.,]\d{1,2})?\s*%\)?)?"]
+MOTIFS_TVA = [r"total\s*t\.?v\.?a\.?", r"montant\s*(?:de\s*la\s*)?t\.?v\.?a\.?", r"total\s*(?:vat|tax(?:es)?)"]
 MOTIF_TOTAL_SEUL = [r"^[ ]*total(?!\s*(?:h|t\.?v|hors|net|g|excl|incl|amount|due))"]
+
+def _tva_ligne(lignes):
+    """Ligne du type 'TVA 20 % : 80,00' : dernier montant à décimales (ignore n° de TVA, mentions d'exonération)."""
+    for l in lignes:
+        if re.match(r"\W*(?:t\.?v\.?a\.?|vat)\b", l, re.I) and \
+           not re.search(r"non\s*applicable|n°|siren|siret|293|intracom|exon|incluse|comprise|\bFR\d|\bon\s*[€$£]?\s*\d|\bsur\s*[€$£]?\s*\d", l, re.I):
+            v = [montant(x) for x in re.findall(NB, re.sub(r"\d{1,2}(?:[.,]\d{1,2})?\s*%", " ", l)) if re.search(r"[.,]\d{2}$", x)]
+            v = [x for x in v if x is not None]
+            if v: return v[-1]
+    return None
 
 def _totaux_tableau(lignes):
     """Tableau : en-tête 'HT / TVA / TTC' puis une ligne de montants."""
@@ -509,6 +518,7 @@ def lire_texte(texte, type_, nom):
     if not numero:
         numero = nom; anom.append(("N° de facture non trouvé (nom du fichier utilisé)", nom))
     ht, ttc, tva_exp = _num(t, MOTIFS_HT), _num(t, MOTIFS_TTC), _num(t, MOTIFS_TVA)
+    if tva_exp is None: tva_exp = _tva_ligne(lignes)
     if ttc is None: ttc = _num(t, MOTIF_TOTAL_SEUL, dernier=True)
     if ht is None or ttc is None:
         h2, t2 = _totaux_tableau(lignes)
