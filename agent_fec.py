@@ -12,7 +12,7 @@ PDF/images : Factur-X (XML intégré) -> texte du PDF (règles) -> OCR PaddleOCR
 -> IA Claude (facultatif, payant, si ANTHROPIC_API_KEY est défini).
 """
 import argparse, hashlib, io, json, os, re, shutil, sys, tempfile, unicodedata, zipfile
-VERSION = "2026.11.05-e"
+VERSION = "2026.11.05-h"
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from decimal import Decimal, ROUND_HALF_UP
@@ -21,15 +21,28 @@ import pandas as pd
 
 # ---------- Paramétrage comptable (à adapter au dossier) ----------
 COMPTES = {
-    "vente": {"journal": ("VE", "Ventes"), "tiers": "411", "charge_produit": "706000",
+    "vente": {"journal": ("VE", "Ventes"), "tiers": "411000", "charge_produit": "706000",
               "libelle_cp": "Prestations de services", "sens_tiers": "D"},
-    "achat": {"journal": ("AC", "Achats"), "tiers": "401", "charge_produit": "607000",
+    "achat": {"journal": ("AC", "Achats"), "tiers": "401000", "charge_produit": "607000",
               "libelle_cp": "Achats de marchandises", "sens_tiers": "C"},
 }
-TVA_COMPTES = {  # taux -> (compte ventes, compte achats)
-    "20": ("44571200", "44566200"), "10": ("44571100", "44566100"),
-    "5.5": ("44571055", "44566055"), "2.1": ("44571021", "44566021"),
+TVA_COMPTES = {  # taux -> (TVA collectée 4457xxx, TVA déductible 4456xxx) : 7 caractères, xxx = taux x 10
+    "20": ("4457200", "4456200"), "10": ("4457100", "4456100"),
+    "5.5": ("4457055", "4456055"), "2.1": ("4457021", "4456021"),
 }
+TVA_INCONNUE = ("4457000", "4456000")
+NATURES = {"706": "Prestations de services", "707": "Ventes de marchandises", "701": "Ventes de produits finis"}
+
+def produits_par_taux(prefixe="706", taux=("20", "10", "5.5", "2.1", "0")):
+    """Comptes de produits par taux de TVA, sur 7 caractères : préfixe (706/707/701) + taux x 100 sur 4 chiffres.
+    Ex. 706 : 20 % -> 7062000 ; 10 % -> 7061000 ; 5,5 % -> 7060550 ; 2,1 % -> 7060210 ; 0 % -> 7060000."""
+    out = {}
+    for t in taux:
+        v = float(t)
+        out[str(t)] = (f"{prefixe}{int(round(v * 100)):04d}", f"{NATURES.get(prefixe, 'Produits')} {('%g' % v).replace('.', ',')} %")
+    return out
+
+PRODUITS_TVA = produits_par_taux("706")
 TVA_LIB = "TVA"
 
 # ---------- Mapping des colonnes ----------
@@ -118,19 +131,19 @@ def sauver_mapping(df, m, dossier="mappings"):
     os.makedirs(dossier, exist_ok=True)
     json.dump(m, open(os.path.join(dossier, f"{empreinte(df)}.json"), "w", encoding="utf-8"), indent=2, ensure_ascii=False)
 
-def exporter_reglages(comptes, tva_comptes, dossier="mappings"):
+def exporter_reglages(comptes, tva_comptes, produits_tva=None, dossier="mappings"):
     """Tout ce qui se règle dans l'app, dans un dictionnaire sauvegardable (JSON)."""
     maps = {}
     if os.path.isdir(dossier):
         for f in os.listdir(dossier):
             if f.endswith(".json"): maps[f[:-5]] = json.load(open(os.path.join(dossier, f), encoding="utf-8"))
-    return {"comptes": comptes, "tva_comptes": tva_comptes, "mappings": maps}
+    return {"comptes": comptes, "tva_comptes": tva_comptes, "produits_tva": produits_tva, "mappings": maps}
 
 def importer_reglages(d, dossier="mappings"):
     os.makedirs(dossier, exist_ok=True)
     for emp, m in (d.get("mappings") or {}).items():
         json.dump(m, open(os.path.join(dossier, f"{emp}.json"), "w", encoding="utf-8"), indent=2, ensure_ascii=False)
-    return d.get("comptes"), d.get("tva_comptes")
+    return d.get("comptes"), d.get("tva_comptes"), d.get("produits_tva")
 
 def charger_mapping(df, dossier="mappings"):
     chemin = os.path.join(dossier, f"{empreinte(df)}.json")
@@ -506,10 +519,18 @@ def _numero(texte):
 ETIQ = {"vente": r"(?:factur[ée]e?\s*[àa]|adresse\s*de\s*facturation|[àa]\s*l'attention\s*de|[àa]\s*destination\s*de|"
                  r"destinataire|client|customer|bill(?:ed)?\s*to|sold\s*to|adress[ée]e?\s*[àa]|nom\s*du\s*client)",
         "achat": r"(?:fournisseur|[ée]metteur|vendeur|vendu\s*par|prestataire|envoy[ée]e?\s*par|from|seller|supplier)"}
-NON_NOM = (r"^(?:facture|avoir|invoice|devis|date|num[ée]ro|n[°º]|total|page|adresse|siret|siren|tva|iban|bic|t[ée]l|"
-           r"email|e-mail|r[ée]f|code|france|paiement|conditions|mode|ech[ée]ance|objet|d[ée]signation|description|"
-           r"quantit[ée]|prix|montant|bon\s*de|commande)\b")
+NON_NOM = (r"^(?:factur\w*|avoir|invoice|devis|date|num[ée]ro|n[°º]|total|page|adresse|adress[ée]\w*|siret|siren|tva|iban|bic|"
+           r"t[ée]l|email|e-mail|r[ée]f|code|france|paiement|conditions|mode|ech[ée]ance|objet|d[ée]signation|"
+           r"description|quantit[ée]|prix|montant|bon\s*de|commande|client|destinataire|livr\w*|bill|sold|ship|"
+           r"doit|[àa]\s*l'attention|[àa]\s*destination)\b")
 RUE = r"(?:rue|avenue|av|bd|boulevard|chemin|impasse|place|all[ée]e|route|cours|quai|zone|za|zi|lotissement|r[ée]sidence)"
+LABELS_ACHETEUR = (r"(?:factur[ée]e?\s*[àa]|adress[ée]e?\s*[àa]|adresse\s*de\s*facturation|[àa]\s*l'attention|"
+                   r"[àa]\s*destination|destinataire|client|customer|bill(?:ed)?\s*to|sold\s*to|livr[ée]e?\s*[àa]|"
+                   r"nom\s*du\s*client|ship\s*to)")
+LEGAL = (r"siret|siren|\brcs\b|capital|n[°º]\s*(?:de\s*)?tva|tva\s*intra\w*|identifiant\s*tva|\bape\b|\bnaf\b|"
+         r"immatricul|vat\s*(?:id|no|number)")
+SEP_LEGAL = (r"\s*[|·•]\s*|\s+[-–—]\s+|,\s|\s+(?:au\s+)?capital|\s+siret|\s+siren|\s+rcs|\s+n[°º]|\s+tva|\s+ape\b|"
+             r"\s+naf\b|\s+immatricul|\s+soci[ée]t[ée]\s+[àa]")
 
 def _nom_valide(s):
     s = s.strip(" :-|")
@@ -522,17 +543,43 @@ def _nettoyer_nom(s):
     s = re.sub(r"^(?:facture|avoir|invoice)\s+", "", s.strip(" :-|"), flags=re.I)
     return re.split(r"\s{2,}|\s+(?:date|n[°º]|num[ée]ro|r[ée]f|page|t[ée]l|email|e-mail|siret|siren|tva)\b", s, 1, flags=re.I)[0].strip(" :-|")
 
-def _tiers_texte(lignes, type_):
+FORMES = {"sarl", "sas", "sasu", "eurl", "sa", "sci", "snc", "scop", "selarl", "earl", "gaec", "ets", "etablissements",
+          "societe", "entreprise", "cie", "and", "les", "des", "du", "la", "le", "de", "et"}
+
+def _meme_societe(a, b):
+    ja = {t for t in norm(a).split() if len(t) >= 3 and t not in FORMES}
+    jb = {t for t in norm(b).split() if len(t) >= 3 and t not in FORMES}
+    return bool(ja and jb) and (ja <= jb or jb <= ja)
+
+def _emetteur_legal(lignes):
+    """Nom de l'émetteur d'après les mentions légales (SIRET, RCS, capital, n° TVA...), en pied de page ou en en-tête."""
     for i, l in enumerate(lignes):
-        m = re.match(rf"\s*{ETIQ[type_]}\s*:?\s*(.*)$", l, re.I)
+        if re.search(LEGAL, l, re.I) and not re.match(rf"\s*{LABELS_ACHETEUR}\b", l, re.I):
+            for cand in (re.split(SEP_LEGAL, l, 1, flags=re.I)[0], lignes[i - 1] if i else ""):
+                c = _nettoyer_nom(cand)
+                if c and _nom_valide(c): return c
+    return ""
+
+def _tiers_texte(lignes, type_):
+    for i, l in enumerate(lignes):                                  # 1. libellé explicite
+        m = re.match(rf"\s*{ETIQ[type_]}\b\s*:?\s*(.*)$", l, re.I)
         if not m: continue
         for cand in [m.group(1)] + lignes[i + 1:i + 5]:
             c = _nettoyer_nom(cand)
             if c and _nom_valide(c): return c
+    em = _emetteur_legal(lignes)                                    # 2. mentions légales de l'émetteur
     if type_ == "achat":
-        for l in lignes[:12]:
+        if em: return em
+        skip = 0                                                    # 3. sinon 1re ligne hors bloc client
+        for l in lignes[:15]:
+            if skip: skip -= 1; continue
+            if re.match(rf"\s*{LABELS_ACHETEUR}\b", l, re.I): skip = 4; continue
             c = _nettoyer_nom(l)
             if c and _nom_valide(c): return c
+    elif em:                                                        # client : 1re ligne qui n'est pas l'émetteur
+        for l in lignes[:15]:
+            c = _nettoyer_nom(l)
+            if c and _nom_valide(c) and not _meme_societe(c, em): return c
     return ""
 
 def lire_texte(texte, type_, nom):
@@ -811,15 +858,34 @@ def trouver_regle(tiers, regles, type_=None):
     return None
 
 # ---------- Contrôles + écritures ----------
-def aux_code(l, prefixe):
-    if l["code"]: return l["code"].upper()[:17]
-    base = re.sub(r"[^A-Z0-9]", "", norm(l["tiers"]).upper())[:8]
-    return ("F" if prefixe == "401" else "C") + base if base else "DIVERS"
+FORMES_DEBUT = {"sarl", "sas", "sasu", "eurl", "sa", "sci", "snc", "scop", "selarl", "earl", "gaec", "ets", "etablissements",
+                "ste", "societe", "mr", "mme", "monsieur", "madame", "m", "le", "la", "les", "l"}
 
-def construire_ecritures(lignes, type_, anomalies, regles=None, comptes=None, tva_comptes=None):
+def code_tiers(nom, type_):
+    """Compte de tiers sur 7 caractères : C + 6 caractères du nom (clients) ou F + 6 (fournisseurs)."""
+    jetons = norm(nom).split()
+    while len(jetons) > 1 and jetons[0] in FORMES_DEBUT: jetons.pop(0)       # SARL, SCI, M., Le... ignorés en tête
+    base = re.sub(r"[^A-Z0-9]", "", "".join(jetons).upper())[:6] or "DIVERS"
+    return ("C" if type_ == "vente" else "F") + base
+
+def code_tiers_unique(nom, type_, codes, anomalies, ref):
+    """Évite que deux tiers différents reçoivent le même compte (suffixe 1, 2, ... à la place du dernier caractère)."""
+    base, cle, cand, k = code_tiers(nom, type_), norm(nom), None, 0
+    cand = base
+    while codes.get(cand, cle) != cle and k < 99:
+        k += 1
+        cand = base[:7 - len(str(k))] + str(k)
+    if cand != base:
+        anomalies.append((ref, f"Compte tiers {base} déjà pris par un autre tiers : {cand} attribué", nom))
+    codes[cand] = cle
+    return cand
+
+def construire_ecritures(lignes, type_, anomalies, regles=None, comptes=None, tva_comptes=None, produits_tva=None):
     cfg = (comptes or COMPTES)[type_]
     tvac = tva_comptes or TVA_COMPTES
-    regles, signales = regles or [], set()
+    regles, signales, codes, tronques = regles or [], set(), {}, set()
+    prod = produits_tva or PRODUITS_TVA
+    pref = next(iter(prod.values()))[0][:3] if prod else "706"
     factures = OrderedDict()
     for l in lignes:
         factures.setdefault((l["numero"], l["tiers"]), []).append(l)
@@ -832,6 +898,7 @@ def construire_ecritures(lignes, type_, anomalies, regles=None, comptes=None, tv
         vus.add(cle)
         d = ls[0]["date"]
         src, page = ls[0]["n"].rsplit(":", 1)[0], ls[0].get("page", "")
+        if ls[0].get("pj"): src, page = ls[0]["pj"], ls[0].get("pj_page", "")
         ht_tot = sum(x["ht"] for x in ls); tva_par_taux = OrderedDict()
         for x in ls: tva_par_taux[x["taux"]] = tva_par_taux.get(x["taux"], Decimal("0")) + x["tva"]
         tva_tot = sum(tva_par_taux.values()); ttc_calc = ht_tot + tva_tot
@@ -846,9 +913,13 @@ def construire_ecritures(lignes, type_, anomalies, regles=None, comptes=None, tv
         avoir = ttc_calc < 0
         num += 1
         lib = f"{numero} {tiers}".strip()[:100]
-        aux = aux_code(ls[0], cfg["tiers"])
+        aux = code_tiers_unique(tiers, type_, codes, anomalies, ls[0]["n"])
         def ecr(compte, libc, aux_n, aux_l, montant_, sens):
             if montant_ == 0: return
+            if len(compte) > 7:                                  # comptes limités à 7 caractères
+                if compte not in tronques:
+                    tronques.add(compte); anomalies.append((ls[0]["n"], f"Compte {compte} tronqué à 7 caractères : {compte[:7]}", numero))
+                compte = compte[:7]
             sens = sens if not avoir else ("C" if sens == "D" else "D")
             ecritures.append(dict(num=num, src=src, page=page, date=d, compte=compte, libc=libc, aux=aux_n, auxl=aux_l,
                                   piece=numero, lib=lib, debit=abs(montant_) if sens == "D" else Decimal("0"),
@@ -860,6 +931,8 @@ def construire_ecritures(lignes, type_, anomalies, regles=None, comptes=None, tv
             if not cpt:
                 reg = trouver_regle(tiers, regles, type_)
                 if reg: cpt, libc = reg[0], (reg[1] or libc)
+                elif type_ == "vente":                           # compte 7 par taux de TVA
+                    cpt, libc = prod.get(x["taux"]) or produits_par_taux(pref, [x["taux"]])[x["taux"]]
                 else:
                     cpt = cfg["charge_produit"]
                     if type_ == "achat" and tiers not in signales:
@@ -867,7 +940,7 @@ def construire_ecritures(lignes, type_, anomalies, regles=None, comptes=None, tv
                         anomalies.append((x["n"], f"Aucune règle d'imputation : compte par défaut {cpt}", tiers))
             ecr(cpt, libc, "", "", x["ht"], sc)
         for t, v in tva_par_taux.items():
-            cpt = tvac.get(t, ("44571000", "44566000"))[idx]
+            cpt = tvac.get(t, TVA_INCONNUE)[idx]
             ecr(cpt, TVA_LIB, "", "", v, sc)
     return ecritures
 
@@ -892,6 +965,112 @@ def ecrire_fec(ecritures, type_, siren, exercice, sortie, comptes=None, separate
                                e["piece"], dd, e["lib"], fmt(e["debit"]), fmt(e["credit"]),
                                "", "", dd, "", ""]) + "\r\n")
     return nom, d_tot
+
+# ---------- ZIP et rapprochement factures <-> pièces justificatives ----------
+EXT_OK = {".csv", ".xlsx", ".xls", ".xlsm", ".pdf", ".png", ".jpg", ".jpeg", ".xml"}
+EXT_TAB = (".csv", ".xlsx", ".xls", ".xlsm")
+EXT_DOC = (".pdf", ".png", ".jpg", ".jpeg")
+
+def extraire_zip(chemin_zip, dest, max_fichiers=2000, max_octets=500 * 1024 * 1024):
+    """Extrait à plat les fichiers utiles d'un zip (sans dossiers, sans fichiers cachés), noms rendus uniques."""
+    os.makedirs(dest, exist_ok=True)
+    sortie, total = [], 0
+    with zipfile.ZipFile(chemin_zip) as z:
+        for info in z.infolist():
+            nom = os.path.basename(info.filename.replace("\\", "/"))
+            if info.is_dir() or not nom or nom.startswith((".", "~$")) or "__MACOSX" in info.filename: continue
+            base, ext = os.path.splitext(nom)
+            if ext.lower() not in EXT_OK: continue
+            total += info.file_size
+            if len(sortie) >= max_fichiers or total > max_octets:
+                raise ValueError("Archive trop volumineuse (plus de 2000 fichiers ou 500 Mo).")
+            cible, k = os.path.join(dest, nom), 2
+            while os.path.exists(cible):
+                cible = os.path.join(dest, f"{base}_{k}{ext}"); k += 1
+            with z.open(info) as src, open(cible, "wb") as out:
+                shutil.copyfileobj(src, out)
+            sortie.append(cible)
+    return sortie
+
+def classer(chemins):
+    """(fichiers comptables CSV/Excel, pièces PDF/images, XML de factures)"""
+    low = lambda p: p.lower()
+    return ([p for p in chemins if low(p).endswith(EXT_TAB)], [p for p in chemins if low(p).endswith(EXT_DOC)],
+            [p for p in chemins if low(p).endswith(".xml")])
+
+_IDX = {}
+def _indexer_piece(chemin):
+    cle = (chemin, os.path.getmtime(chemin))
+    if cle not in _IDX:
+        pages = []
+        if chemin.lower().endswith(".pdf"):
+            v = textes_pdf(chemin)
+            pages = v[0] if v else []
+        texte = _norm_txt("\n".join(pages))
+        _IDX[cle] = {"chemin": chemin, "nom": os.path.basename(chemin), "pages": pages, "multi": len(pages) > 1,
+                     "texte": texte,
+                     "montants": {abs(m) for m in (montant(x) for x in re.findall(NB, texte)) if m is not None},
+                     "dates": {_conv_date(r.group(0)) for r in D_ALL.finditer(texte)} - {""},
+                     "jetons": set(norm(texte + " " + os.path.basename(chemin)).split())}
+    return _IDX[cle]
+
+def _re_numero(numero):
+    runs = re.findall(r"[A-Za-z0-9]+", numero or "")
+    if not runs: return None
+    return re.compile(r"(?<![A-Za-z0-9])" + r"[\s\-_/.]*".join(re.escape(r) for r in runs) + r"(?![A-Za-z0-9])", re.I)
+
+def _score_piece(f, info):
+    s, met = 0.0, []
+    rx, fort = f["rx"], len(re.sub(r"[^A-Za-z0-9]", "", f["numero"])) >= 4
+    if rx and rx.search(info["nom"]): s += 5 if fort else 2; met.append("n° dans le nom du fichier")
+    if rx and rx.search(info["texte"]): s += 4 if fort else 1.5; met.append("n° dans la facture")
+    if f["montants"] & info["montants"]: s += 2; met.append("montant")
+    jt = {t for t in norm(f["tiers"]).split() if len(t) >= 3 and t not in FORMES}
+    if jt and jt <= info["jetons"]: s += 1.5; met.append("tiers")
+    if f["date"] in info["dates"]: s += 1; met.append("date")
+    return s, met
+
+def rapprocher(lignes, pieces, manuels=None):
+    """Associe chaque facture du fichier comptable à sa pièce (n° de facture dans le nom ou le texte du PDF,
+    sinon montant + tiers + date). Renseigne l['pj'] / l['pj_page'] et renvoie le détail du rapprochement."""
+    infos = [_indexer_piece(p) for p in pieces]
+    par_nom = {i["nom"]: i for i in infos}
+    facts = OrderedDict()
+    for l in lignes:
+        cle = f"{l['n'].rsplit(':', 1)[0]}|{l['numero']}"
+        f = facts.setdefault(cle, {"cle": cle, "numero": l["numero"], "tiers": l["tiers"], "date": l["date"].strftime("%d/%m/%Y"),
+                                   "ht": Decimal("0"), "tva": Decimal("0"), "ttcs": [], "rx": _re_numero(l["numero"])})
+        f["ht"] += l["ht"]; f["tva"] += l["tva"]; f["ttcs"].append(l["ttc"])
+    for f in facts.values():
+        f["ttc"] = f["ht"] + f["tva"]
+        f["montants"] = {abs(f["ttc"])} | {abs(x) for x in f["ttcs"] if x is not None}
+    cands = {}
+    for k, f in facts.items():
+        cands[k] = sorted(((sc, i["nom"], met) for i in infos for sc, met in [_score_piece(f, i)] if sc >= 3), key=lambda x: -x[0])
+    res, utilises = {}, set()
+    for k in sorted(cands, key=lambda k: -(cands[k][0][0] if cands[k] else 0)):
+        liste = cands[k]
+        if not liste: continue
+        if len(liste) > 1 and liste[0][0] == liste[1][0] and liste[0][1] != liste[1][1]:
+            res[k] = ("", 0, ["ambigu : plusieurs pièces possibles"]); continue
+        for sc, nom, met in liste:
+            if par_nom[nom]["multi"] or nom not in utilises:
+                res[k] = (nom, sc, met); utilises.add(nom); break
+    for k, nom in (manuels or {}).items():                      # choix manuels de l'utilisateur
+        if k in facts:
+            res[k] = (nom, 99, ["choix manuel"]) if nom else ("", 0, ["aucune (choix manuel)"])
+    pages = {}
+    for k, (nom, sc, met) in res.items():                       # PDF multi-factures : page de chaque facture
+        if nom and par_nom[nom]["multi"] and sum(1 for v in res.values() if v[0] == nom) >= 2:
+            rx = facts[k]["rx"]
+            pages[k] = next((str(i) for i, p in enumerate(par_nom[nom]["pages"], 1) if rx and rx.search(p)), "")
+    for l in lignes:
+        k = f"{l['n'].rsplit(':', 1)[0]}|{l['numero']}"
+        if res.get(k, ("",))[0]:
+            l["pj"], l["pj_page"] = res[k][0], pages.get(k, "")
+    return [{"cle": k, "numero": f["numero"], "tiers": f["tiers"], "ttc": str(f["ttc"]),
+             "piece": res.get(k, ("",))[0], "page": pages.get(k, ""),
+             "methode": ", ".join(res[k][2]) if k in res else "aucune pièce trouvée"} for k, f in facts.items()]
 
 def creer_archive(ecritures, fec, sources, type_, comptes=None):
     """Zip : FEC + dossier pieces_jointes (1 fichier par facture, nommé JOURNAL_NUMECRITURE_REFPIECE) + index."""
@@ -934,7 +1113,7 @@ def creer_archive(ecritures, fec, sources, type_, comptes=None):
     return zip_path
 
 def traiter(fichiers, type_="vente", siren="000000000", exercice="", sortie=".", regles=None,
-            mappings=None, comptes=None, tva_comptes=None, separateur="tab"):
+            mappings=None, comptes=None, tva_comptes=None, separateur="tab", tiers_corriges=None, pieces=None, rapprochements=None, produits_tva=None):
     anomalies, lignes = [], []
     for f in fichiers:
         nom = os.path.basename(f)
@@ -948,17 +1127,28 @@ def traiter(fichiers, type_="vente", siren="000000000", exercice="", sortie=".",
         lignes += vers_pivot(df, (mappings or {}).get(nom) or charger_mapping(df), anomalies, nom)
     if not lignes:
         raise ValueError("Aucune écriture exploitable : " + " ; ".join(f"{a[0]} - {a[1]}" for a in anomalies[:3]))
+    for l in lignes:                                         # noms de tiers corrigés dans l'app
+        cle = f"{l['n'].rsplit(':', 1)[0]}|{l['numero']}"
+        if (tiers_corriges or {}).get(cle):
+            l["tiers"], l["code"] = tiers_corriges[cle], ""
+    rapp = rapprocher(lignes, pieces, rapprochements) if pieces else []
+    for rr in rapp:
+        if not rr["piece"]:
+            anomalies.append((rr["cle"].split("|")[0], "Pièce justificative non trouvée (" + rr["methode"] + ")", rr["numero"]))
+    factures = list(OrderedDict(((f"{l['n'].rsplit(':', 1)[0]}|{l['numero']}"),
+                                 {"cle": f"{l['n'].rsplit(':', 1)[0]}|{l['numero']}", "fichier": l["n"].rsplit(":", 1)[0],
+                                  "numero": l["numero"], "tiers": l["tiers"]}) for l in lignes).values())
     ecr = construire_ecritures(lignes, type_, anomalies,
                                preparer_regles(regles if regles is not None else charger_imputations()),
-                               comptes, tva_comptes)
+                               comptes, tva_comptes, produits_tva)
     fec, total = ecrire_fec(ecr, type_, siren, exercice, sortie, comptes, separateur)
-    archive = creer_archive(ecr, fec, {os.path.basename(f): f for f in fichiers}, type_, comptes)
+    archive = creer_archive(ecr, fec, {os.path.basename(f): f for f in list(fichiers) + list(pieces or [])}, type_, comptes)
     rapport = None
     if anomalies:
         rapport = os.path.join(sortie, "rapport_anomalies.csv")
         pd.DataFrame(anomalies, columns=["ligne_source", "anomalie", "detail"]).to_csv(rapport, index=False, sep=";")
     sans = sorted({a[2] for a in anomalies if a[1].startswith("Aucune règle d'imputation")})
-    return dict(fec=fec, zip=archive, ecritures=ecr, anomalies=anomalies, rapport=rapport, total=total, sans_regle=sans)
+    return dict(rapprochements=rapp, factures=factures, fec=fec, zip=archive, ecritures=ecr, anomalies=anomalies, rapport=rapport, total=total, sans_regle=sans)
 
 def main():
     p = argparse.ArgumentParser()
@@ -968,8 +1158,14 @@ def main():
     p.add_argument("--imputations", default="imputations.csv")
     p.add_argument("--separateur", choices=["tab", "pipe"], default="tab")
     a = p.parse_args()
+    tous = []
+    for f in a.fichiers:
+        tous += extraire_zip(f, tempfile.mkdtemp()) if f.lower().endswith(".zip") else [f]
+    tab, docs, xmls = classer(tous)
+    fichiers, pieces = (tab + xmls, docs) if tab and docs else (tous, None)
     try:
-        r = traiter(a.fichiers, a.type, a.siren, a.exercice, a.sortie, charger_imputations(a.imputations), separateur=a.separateur)
+        r = traiter(fichiers, a.type, a.siren, a.exercice, a.sortie, charger_imputations(a.imputations),
+                    separateur=a.separateur, pieces=pieces)
     except ValueError as e:
         sys.exit(str(e))
     print(f"FEC généré : {r['fec']}  ({len(r['ecritures'])} lignes, débit = crédit = {r['total']})")

@@ -9,7 +9,7 @@ st.title("🧾 Factures → FEC pour ACD")
 ss = st.session_state
 
 # Vérifie que agent_fec.py est bien la dernière version (sinon message clair au lieu d'une erreur masquée)
-_REQUIS = ["VERSION", "CHAMPS_LIBELLES", "importer_reglages", "exporter_reglages", "fusionner_modele", "sauver_mapping", "creer_archive", "OBLIGATOIRES", "TVA_COMPTES"]
+_REQUIS = ["VERSION", "CHAMPS_LIBELLES", "importer_reglages", "exporter_reglages", "fusionner_modele", "sauver_mapping", "creer_archive", "extraire_zip", "rapprocher", "produits_par_taux", "OBLIGATOIRES", "TVA_COMPTES"]
 _manque = [n for n in _REQUIS if not hasattr(ag, n)]
 if _manque:
     st.error("agent_fec.py n'est pas à jour sur GitHub (il manque : " + ", ".join(_manque) +
@@ -21,19 +21,26 @@ rerun = getattr(st, "rerun", None) or st.experimental_rerun   # compatibilité a
 def tva_df(d):
     return pd.DataFrame([(k, v[0], v[1]) for k, v in d.items()], columns=["taux", "compte_ventes", "compte_achats"])
 
-def appliquer_reglages(c, t):
+def produits_df(d):
+    return pd.DataFrame([(k, v[0], v[1]) for k, v in d.items()], columns=["taux", "compte", "libelle"])
+
+def appliquer_reglages(c, t, p=None):
     for ty, base in (c or {}).items():
         ss[f"cpt_{ty}_tiers"], ss[f"cpt_{ty}_cp"], ss[f"cpt_{ty}_lib"] = base["tiers"], base["charge_produit"], base["libelle_cp"]
         ss[f"cpt_{ty}_jcode"], ss[f"cpt_{ty}_jlib"] = base["journal"][0], base["journal"][1]
     if t:
         ss.tva_base = tva_df(t)
         ss.pop("ed_tva", None)
+    if p:
+        ss.prod_base = produits_df(p)
+        ss.pop("ed_prod", None)
 
 if "init" not in ss:
     ss.init = True
     ss.tmp = tempfile.mkdtemp()
     ss.imput_base = ag.charger_imputations()
     ss.tva_base = tva_df(ag.TVA_COMPTES)
+    ss.prod_base = produits_df(ag.PRODUITS_TVA)
     if os.path.exists("reglages.json"):                      # réglages sauvegardés dans GitHub
         appliquer_reglages(*ag.importer_reglages(json.load(open("reglages.json", encoding="utf-8"))))
 if "reglages_a_charger" in ss:                               # import demandé dans l'onglet Réglages
@@ -50,7 +57,12 @@ def comptes_ui():
         taux = str(r["taux"]).strip().replace(",", ".")
         if taux and taux != "nan":
             tva[taux] = (str(r["compte_ventes"]).strip(), str(r["compte_achats"]).strip())
-    return c, tva
+    prod = {}
+    for _, r in ss.get("prod_courant", ss.prod_base).iterrows():
+        taux = ag.taux_str(str(r["taux"]).strip().replace(",", "."))
+        if taux and taux != "nan" and str(r["compte"]).strip():
+            prod[taux] = (str(r["compte"]).strip(), str(r["libelle"]).strip())
+    return c, tva, prod
 
 def mapping_choisi(nom):
     m = {ch: ss.get(f"map_{nom}_{ch}") for ch in ag.CHAMPS_LIBELLES}
@@ -58,7 +70,7 @@ def mapping_choisi(nom):
 
 def afficher_piece(e):
     """Affiche la facture d'origine d'une écriture (PDF, image, XML ou ligne du CSV/Excel)."""
-    chemin = os.path.join(ss.tmp, e["src"])
+    chemin = ss.get("index_chemins", {}).get(e["src"]) or os.path.join(ss.tmp, e["src"])
     page = f", page {e['page']}" if e["page"] else ""
     st.markdown(f"**👁️ Facture {e['piece']}** · {e['src']}{page}")
     ext = os.path.splitext(chemin)[1].lower()
@@ -96,22 +108,45 @@ tab1, tab2, tab3 = st.tabs(["📄 Traitement", "📒 Imputations", "⚙️ Régl
 with tab1:
     st.caption("CSV/Excel : règles · XML Factur-X/UBL · PDF texte : règles · Scans : OCR si installé, sinon IA (clé facultative)")
     fichiers = st.file_uploader("Déposez vos exports ou factures", accept_multiple_files=True,
-                                type=["csv", "xlsx", "xls", "pdf", "xml", "png", "jpg", "jpeg"])
+                                type=["zip", "csv", "xlsx", "xls", "pdf", "xml", "png", "jpg", "jpeg"])
+    ss.setdefault("zips", {})
     chemins = {}
     for f in fichiers or []:
         p = os.path.join(ss.tmp, f.name)
         open(p, "wb").write(f.getbuffer())
-        chemins[f.name] = p
-    tabulaires = [n for n in chemins if n.lower().endswith((".csv", ".xlsx", ".xls", ".xlsm"))]
+        if f.name.lower().endswith(".zip"):                  # zip : extraction unique, mise en cache
+            cle = (f.name, f.size)
+            if cle not in ss.zips:
+                try:
+                    ss.zips[cle] = ag.extraire_zip(p, os.path.join(ss.tmp, f"zip{len(ss.zips)}"))
+                except Exception as ex:
+                    st.error(f"{f.name} : {ex}"); ss.zips[cle] = []
+            for q in ss.zips[cle]:
+                chemins[os.path.basename(q)] = q
+        else:
+            chemins[f.name] = p
+    ss.index_chemins = chemins
+    tabulaires, docs, xmls = [[os.path.basename(p) for p in L] for L in ag.classer(list(chemins.values()))]
+    pieces_noms = []
+    if tabulaires and docs:
+        if st.checkbox("📎 Rapprocher automatiquement les PDF / images du fichier Excel (pièces justificatives)",
+                       value=True, key="use_pieces"):
+            pieces_noms = docs
+    a_traiter = tabulaires + xmls + ([] if pieces_noms else docs)
+    if tabulaires and docs:
+        st.caption(f"{len(tabulaires)} fichier(s) comptable(s) · {len(docs)} PDF/image(s) · "
+                   + ("les PDF servent de pièces justificatives." if pieces_noms else "les PDF sont lus comme des factures."))
 
     def lancer():
-        c, t = comptes_ui()
+        c, t, p = comptes_ui()
         maps = {n: mapping_choisi(n) for n in tabulaires if mapping_choisi(n)}
         try:
             with st.spinner("Analyse en cours…"):
-                ss.res = ag.traiter(list(chemins.values()), type_, siren, exercice, ss.tmp,
-                                    regles=ss.get("imput_courant", ss.imput_base), mappings=maps, comptes=c, tva_comptes=t,
-                                    separateur="pipe" if ss.get("sep_fec") == "Pipe |" else "tab")
+                ss.res = ag.traiter([chemins[n] for n in a_traiter], type_, siren, exercice, ss.tmp,
+                                    regles=ss.get("imput_courant", ss.imput_base), mappings=maps, comptes=c, tva_comptes=t, produits_tva=p,
+                                    separateur="pipe" if ss.get("sep_fec") == "Pipe |" else "tab",
+                                    tiers_corriges=ss.get("tiers_corriges"),
+                                    pieces=[chemins[n] for n in pieces_noms], rapprochements=ss.get("rapp_manuels"))
             ss.err = None
         except ValueError as e:
             ss.res, ss.err = None, str(e)
@@ -132,6 +167,40 @@ with tab1:
         if r.get("zip"):
             st.download_button("📎 FEC + pièces jointes (zip)", open(r["zip"], "rb").read(),
                                file_name=os.path.basename(r["zip"]), mime="application/zip")
+        if r.get("rapprochements"):
+            rap = pd.DataFrame(r["rapprochements"])
+            nb = int((rap["piece"] != "").sum())
+            st.info(f"📎 {nb} facture(s) sur {len(rap)} rapprochée(s) d'une pièce justificative.")
+            with st.expander("🔗 Rapprochement factures ↔ pièces", expanded=nb < len(rap)):
+                aff = rap[["numero", "tiers", "ttc", "piece", "methode"]].copy()
+                aff["piece"] = aff["piece"].replace("", "(aucune)")
+                ed2 = st.data_editor(aff, hide_index=True, use_container_width=True,
+                                     disabled=["numero", "tiers", "ttc", "methode"],
+                                     column_config={"piece": st.column_config.SelectboxColumn("pièce", options=["(aucune)"] + pieces_noms)},
+                                     key=f"ed_rapp_{ss.get('n_rapp', 0)}")
+                if st.button("Appliquer le rapprochement et régénérer"):
+                    man = dict(ss.get("rapp_manuels") or {})
+                    for i in rap.index:
+                        if ed2.loc[i, "piece"] != aff.loc[i, "piece"]:
+                            man[rap.loc[i, "cle"]] = "" if ed2.loc[i, "piece"] == "(aucune)" else ed2.loc[i, "piece"]
+                    ss.rapp_manuels = man
+                    ss.n_rapp = ss.get("n_rapp", 0) + 1
+                    lancer()
+                    rerun()
+        with st.expander("✏️ Vérifier ou corriger les noms de tiers"):
+            fac = pd.DataFrame(r["factures"])
+            ed = st.data_editor(fac[["fichier", "numero", "tiers"]], hide_index=True, use_container_width=True,
+                                disabled=["fichier", "numero"], key=f"ed_tiers_{ss.get('n_tiers', 0)}")
+            if st.button("Appliquer les corrections et régénérer"):
+                corr = dict(ss.get("tiers_corriges") or {})
+                for i in fac.index:
+                    nouveau = str(ed.loc[i, "tiers"]).strip()
+                    if nouveau and nouveau != str(fac.loc[i, "tiers"]).strip():
+                        corr[fac.loc[i, "cle"]] = nouveau
+                ss.tiers_corriges = corr
+                ss.n_tiers = ss.get("n_tiers", 0) + 1
+                lancer()
+                rerun()
         if r["sans_regle"]:
             st.subheader("Comptes à renseigner")
             st.caption("Ces tiers n'ont pas de règle : le compte par défaut a été utilisé. "
@@ -225,6 +294,17 @@ with tab3:
             a3.text_input("Code journal", b["journal"][0], key=f"cpt_{t}_jcode")
             a4.text_input("Libellé du journal", b["journal"][1], key=f"cpt_{t}_jlib")
             st.text_input("Libellé du compte par défaut", b["libelle_cp"], key=f"cpt_{t}_lib")
+        st.caption("Comptes limités à 7 caractères. Compte de tiers : C + 6 premiers caractères du nom (clients), "
+                   "F + 6 (fournisseurs), généré automatiquement.")
+        st.markdown("**Comptes de produits par taux de TVA (ventes)**")
+        n1, n2 = st.columns([3, 2])
+        nature = n1.radio("Nature des ventes", list(ag.NATURES), format_func=lambda k: f"{k} · {ag.NATURES[k]}",
+                          key="nature_ventes")
+        if n2.button("Proposer les comptes"):
+            ss.prod_base = produits_df(ag.produits_par_taux(nature))
+            ss.pop("ed_prod", None)
+        ss.prod_courant = st.data_editor(ss.prod_base, num_rows="dynamic", hide_index=True,
+                                         use_container_width=True, key="ed_prod")
         st.markdown("**Comptes de TVA par taux**")
         ss.tva_courant = st.data_editor(ss.tva_base, num_rows="dynamic", hide_index=True,
                                         use_container_width=True, key="ed_tva")
@@ -233,9 +313,9 @@ with tab3:
         st.caption("Les deux sont admis pour un FEC. Choisissez celui que votre import ACD accepte (certaines sources "
                    "indiquent que le FEC pour ACD utilise le séparateur pipe : à confirmer auprès d'ACD).")
     with st.expander("💾 Sauvegarde des réglages"):
-        c, t = comptes_ui()
+        c, t, p = comptes_ui()
         st.download_button("⬇️ Télécharger mes réglages (reglages.json)",
-                           json.dumps(ag.exporter_reglages(c, t), ensure_ascii=False, indent=2).encode("utf-8"),
+                           json.dumps(ag.exporter_reglages(c, t, p), ensure_ascii=False, indent=2).encode("utf-8"),
                            file_name="reglages.json", mime="application/json")
         st.caption("Pour les garder : ajoutez ce fichier à la racine de GitHub, il sera rechargé au démarrage.")
         rg = st.file_uploader("Restaurer des réglages (reglages.json)", type="json", key="reg_up")
