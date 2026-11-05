@@ -12,6 +12,7 @@ PDF/images : Factur-X (XML intégré) -> texte du PDF (règles) -> OCR PaddleOCR
 -> IA Claude (facultatif, payant, si ANTHROPIC_API_KEY est défini).
 """
 import argparse, hashlib, io, json, os, re, sys, unicodedata
+VERSION = "2026.11.05-d"
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from decimal import Decimal, ROUND_HALF_UP

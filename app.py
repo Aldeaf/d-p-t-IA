@@ -8,6 +8,15 @@ st.set_page_config(page_title="Factures → FEC", page_icon="🧾")
 st.title("🧾 Factures → FEC pour ACD")
 ss = st.session_state
 
+# Vérifie que agent_fec.py est bien la dernière version (sinon message clair au lieu d'une erreur masquée)
+_REQUIS = ["VERSION", "CHAMPS_LIBELLES", "importer_reglages", "exporter_reglages", "fusionner_modele", "sauver_mapping", "OBLIGATOIRES", "TVA_COMPTES"]
+_manque = [n for n in _REQUIS if not hasattr(ag, n)]
+if _manque:
+    st.error("agent_fec.py n'est pas à jour sur GitHub (il manque : " + ", ".join(_manque) +
+             "). Remplacez-le par la dernière version, puis faites Manage app → Reboot app.")
+    st.stop()
+rerun = getattr(st, "rerun", None) or st.experimental_rerun   # compatibilité anciennes versions de Streamlit
+
 # ---------- état initial (avant tout widget) ----------
 def tva_df(d):
     return pd.DataFrame([(k, v[0], v[1]) for k, v in d.items()], columns=["taux", "compte_ventes", "compte_achats"])
@@ -54,6 +63,7 @@ col1, col2 = st.columns(2)
 siren = col1.text_input("SIREN du dossier", "000000000")
 exercice = col2.text_input("Exercice (AAAA)", "2026")
 with st.sidebar:
+    st.caption(f"Version {ag.VERSION}")
     cle = st.text_input("Clé API Anthropic (facultative, secours IA)", type="password")
     if cle:
         os.environ["ANTHROPIC_API_KEY"] = cle
@@ -109,7 +119,7 @@ with tab1:
                     ss.pop("ed_imput", None)
                     ss.imput_courant = ss.imput_base
                     lancer()
-                    st.rerun()
+                    rerun()
         rest = [a for a in r["anomalies"] if not a[1].startswith("Aucune règle d'imputation")]
         if rest:
             st.warning("Points à vérifier avant import dans ACD :")
@@ -187,4 +197,4 @@ with tab3:
         if rg is not None and ss.get("reg_nom") != (rg.name, rg.size):
             ss.reg_nom = (rg.name, rg.size)
             ss.reglages_a_charger = json.loads(rg.getvalue().decode("utf-8"))
-            st.rerun()
+            rerun()
