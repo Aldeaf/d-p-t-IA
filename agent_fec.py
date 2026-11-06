@@ -12,7 +12,7 @@ PDF/images : Factur-X (XML intégré) -> texte du PDF (règles) -> OCR PaddleOCR
 -> IA Claude (facultatif, payant, si ANTHROPIC_API_KEY est défini).
 """
 import argparse, hashlib, io, json, os, re, shutil, sys, tempfile, unicodedata, zipfile
-VERSION = "2026.11.06-k"
+VERSION = "2026.11.06-l"
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from decimal import Decimal, ROUND_HALF_UP
@@ -52,22 +52,27 @@ SYNONYMES = {
              "invoice date", "issue date", "date of issue", "date creation", "date de creation", "created", "date"],
     "numero": ["numero facture", "numero de facture", "n facture", "n de facture", "no facture", "num facture", "n piece",
                "numero piece", "numero de piece", "n de piece", "reference facture", "ref facture", "invoice number",
-               "invoice no", "invoice", "document", "numero", "reference", "ref", "num", "facture", "piece"],
+               "invoice no", "invoice", "document", "numero", "reference", "ref", "num", "facture", "piece",
+               "n de document", "numero document", "n document", "n avoir", "numero avoir", "id facture", "facture n",
+               "facture no", "n", "no", "nr", "doc", "n doc", "num doc", "num piece", "id"],
     "tiers": ["client", "nom client", "nom du client", "raison sociale", "fournisseur", "nom fournisseur",
               "nom du fournisseur", "tiers", "nom tiers", "societe", "entreprise", "denomination", "customer",
-              "customer name", "supplier", "vendor", "contact", "libelle tiers", "intitule tiers"],
+              "customer name", "supplier", "vendor", "contact", "libelle tiers", "intitule tiers",
+              "raison sociale client", "raison sociale fournisseur", "client raison sociale", "nom commercial",
+              "enseigne", "acheteur", "destinataire", "emetteur", "beneficiaire", "intitule client", "libelle client",
+              "intitule fournisseur", "nom", "company", "nom societe", "nom entreprise", "buyer", "seller"],
     "code_tiers": ["code client", "code tiers", "compte client", "compte tiers", "code fournisseur", "compte fournisseur",
                    "n client", "numero client", "compte auxiliaire", "auxiliaire", "customer id", "customer code",
                    "id client", "ref client"],
     "ht": ["total ht", "montant ht", "ht", "hors taxe", "hors taxes", "net ht", "total hors taxe", "total hors taxes",
-           "montant hors taxe", "montant hors taxes", "base ht", "sous total", "subtotal", "amount excl", "total excl tax",
+           "montant hors taxe", "montant hors taxes", "base ht", "base", "base hors taxe", "sous total", "subtotal", "amount excl", "total excl tax",
            "net amount", "prix ht", "total net", "montant net ht", "untaxed amount"],
     "tva": ["total tva", "montant tva", "tva", "taxe", "taxes", "vat", "tax amount", "total taxes", "montant de la tva",
             "total vat", "montant taxe"],
     "ttc": ["total ttc", "montant ttc", "ttc", "total", "net a payer", "amount incl", "total amount", "montant total",
             "total toutes taxes comprises", "gross", "total due", "total a payer", "total general", "grand total",
             "amount due", "montant a payer"],
-    "taux_tva": ["taux tva", "taux de tva", "taux", "% tva", "tva %", "vat rate", "tax rate", "tva pct", "code tva", "taux taxe"],
+    "taux_tva": ["taux tva", "taux de tva", "taux", "% tva", "tva %", "vat rate", "tax rate", "tva pct", "code tva", "taux taxe", "tx", "tx tva", "tva taux"],
     "libelle": ["libelle", "designation", "description", "objet", "intitule", "produit", "article"],
     "compte": ["compte produit", "compte comptable", "compte", "compte de produit", "compte de charge", "code comptable", "account"],
 }
@@ -77,21 +82,145 @@ def norm(s):
     s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode().lower()
     return re.sub(r"[^a-z0-9% ]+", " ", s).strip()
 
-def mapping_regles(colonnes):
+# Mots qui, présents dans l'intitulé, interdisent un champ (ex. « N° client » n'est pas un n° de facture)
+EXCLUS = {
+    "date": ["echeance", "reglement", "paiement", "livraison", "naissance", "limite", "modification", "maj", "export",
+             "envoi", "relance", "encaissement", "valeur", "debut", "fin", "periode", "expedition", "due"],
+    "numero": ["client", "fournisseur", "tiers", "customer", "supplier", "siret", "siren", "intracom", "intracommunautaire",
+               "telephone", "tel", "commande", "bon", "bl", "livraison", "devis", "ligne", "article", "produit", "compte",
+               "lot", "serie", "cheque", "iban", "rib", "postal", "rue", "voie", "date", "montant", "total", "ht", "ttc",
+               "tva", "type", "statut", "etat", "nombre", "quantite", "qte", "page", "order", "po", "contrat", "dossier",
+               "code", "mode", "taux", "nom", "libelle", "designation", "affaire", "projet", "chantier", "immatriculation"],
+    "tiers": ["code", "n", "no", "numero", "num", "id", "ref", "reference", "compte", "adresse", "rue", "ville", "cp",
+              "postal", "pays", "email", "mail", "tel", "telephone", "siret", "siren", "tva", "civilite", "prenom",
+              "date", "montant", "total", "iban", "type", "categorie", "groupe", "famille", "commercial", "vendeur"],
+    "code_tiers": ["date", "montant", "total", "siret", "siren", "tva", "nom", "raison", "adresse"],
+    "ht": ["unitaire", "pu", "remise", "escompte", "acompte", "deja", "reste", "quantite", "qte", "taux", "ttc", "tva"],
+    "tva": ["intracom", "intracommunautaire", "numero", "n", "taux", "%", "regime", "exoneration", "mention", "code", "ht",
+            "ttc", "pct"],
+    "ttc": ["ht", "tva", "regle", "paye", "payee", "reste", "solde", "acompte", "deja", "encaisse", "quantite", "qte",
+            "unitaire", "remise", "nombre", "taux", "lignes"],
+    "taux_tva": ["remise", "escompte", "commission", "marge", "change", "horaire", "montant"],
+    "libelle": ["tiers", "client", "fournisseur", "compte", "tva", "journal"],
+    "compte": ["client", "fournisseur", "tiers", "auxiliaire", "bancaire", "iban", "libelle", "intitule"],
+}
+CLIENT_MOTS, FOURN_MOTS = r"\b(client|customer|acheteur|destinataire|buyer)s?\b", r"\b(fournisseur|supplier|vendor|emetteur|seller)s?\b"
+
+def _profil(serie):
+    """Statistiques simples sur le contenu d'une colonne (échantillon des 200 premières valeurs non vides)."""
+    v = [str(x).strip() for x in serie.dropna().head(400) if str(x).strip() not in ("", "nan", "None")][:200]
+    n = len(v) or 1
+    lettres = lambda x: len(re.findall(r"[A-Za-zÀ-ÿ]", x))
+    chiffres = lambda x: len(re.findall(r"\d", x))
+    return dict(n=len(v),
+                date=sum(date(x) is not None for x in v) / n,
+                montant=sum(montant(x) is not None and not re.search(r"[A-Za-zÀ-ÿ]{2,}", x) for x in v) / n,
+                decimal=sum(bool(re.fullmatch(r"-?\d+[.,]\d{1,2}", x.replace(" ", ""))) for x in v) / n,
+                texte=sum(lettres(x) >= 2 and lettres(x) > chiffres(x) for x in v) / n,
+                chiffre=sum(chiffres(x) >= 1 for x in v) / n,
+                taux=sum((lambda m: m is not None and 0 <= m <= 30)(montant(x)) for x in v) / n,
+                distinct=len(set(v)), mail=sum("@" in x for x in v) / n,
+                code=sum(bool(re.fullmatch(r"[A-Za-z]{0,6}[-_/.]?\d[\w\-/.]*", x)) for x in v) / n)
+
+def _score_entete(champ, n, type_=None):
+    """Score de l'intitulé normalisé n pour un champ (None = impossible)."""
+    mots = set(n.split())
+    best = None
+    for k, syn in enumerate(SYNONYMES[champ]):
+        if n == syn:
+            sc = 100 + 3 * len(syn.split()) - 0.2 * k
+        elif re.search(rf"\b{re.escape(syn)}\b", n) and len(syn) > 2:
+            sc = 55 + 3 * len(syn.split()) - 2 * (len(mots) - len(syn.split())) - 0.2 * k
+        else:
+            continue
+        best = sc if best is None else max(best, sc)
+    if best is None: return None
+    if best < 100 and any(x in mots or (" " in x and x in n) for x in EXCLUS.get(champ, [])):
+        return None                                             # intitulé partiel avec un mot exclu
+    if champ in ("tiers", "code_tiers") and type_ in ("vente", "achat"):
+        bon, mauvais = (CLIENT_MOTS, FOURN_MOTS) if type_ == "vente" else (FOURN_MOTS, CLIENT_MOTS)
+        if re.search(mauvais, n): best -= 60                    # colonne de l'autre partie (ex. fournisseur en vente)
+        elif re.search(bon, n): best += 15
+    if champ == "tiers" and n in ("raison sociale", "societe", "entreprise", "denomination", "nom", "contact", "company"):
+        best -= 8                                               # intitulé générique : passe après « nom client »
+    return best
+
+def _score_contenu(champ, p):
+    """Bonus/malus selon le contenu ; None = contenu incompatible avec le champ."""
+    if not p or p["n"] == 0: return 0
+    if champ == "date":
+        return None if p["date"] < 0.6 else 15 * p["date"]
+    if champ in ("ht", "tva", "ttc"):
+        return None if p["montant"] < 0.6 or p["date"] > 0.5 else 10 * p["montant"]
+    if champ == "taux_tva":
+        return None if p["taux"] < 0.6 or p["date"] > 0.5 else 10
+    if champ == "numero":
+        if p["chiffre"] < 0.5 or p["date"] > 0.6 or p["mail"] > 0.2: return None
+        sc = 10 - 25 * p["decimal"]
+        if p["n"] >= 3 and p["distinct"] == 1: sc -= 40         # même valeur partout : pas un n° de facture
+        return sc
+    if champ == "tiers":
+        if p["texte"] < 0.5 or p["date"] > 0.5 or p["mail"] > 0.3 or p["code"] > 0.6: return None
+        sc = 10 * p["texte"]
+        if p["n"] >= 3 and p["distinct"] == 1: sc -= 45         # même nom partout : sans doute votre propre société
+        return sc
+    return 0
+
+def mapping_regles(colonnes, df=None, type_=None):
+    """Associe chaque champ à la meilleure colonne : intitulé (synonymes, mots exclus, client/fournisseur)
+    + contrôle du contenu (dates, montants, textes) si le tableau est fourni. Affectation globale par score."""
+    cols = [c for c in colonnes]
+    profils = {c: _profil(df[c]) for c in cols} if df is not None else {}
+    cand = []
+    for champ in SYNONYMES:
+        for c in cols:
+            sc = _score_entete(champ, norm(c), type_)
+            if sc is None: continue
+            if df is not None:
+                cc = _score_contenu(champ, profils.get(c))
+                if cc is None: continue
+                sc += cc
+            cand.append((sc, champ, c))
     res, pris = {}, set()
-    cols = {c: norm(c) for c in colonnes}
-    for champ, syns in SYNONYMES.items():           # 1) correspondance exacte
-        for c, n in cols.items():
-            if c not in pris and n in syns:
-                res[champ] = c; pris.add(c); break
-    for champ, syns in SYNONYMES.items():           # 2) correspondance partielle
-        if champ in res: continue
-        for s in syns:
-            for c, n in cols.items():
-                if c not in pris and re.search(rf"\b{re.escape(s)}\b", n):
-                    res[champ] = c; pris.add(c); break
-            if champ in res: break
+    for sc, champ, c in sorted(cand, key=lambda x: -x[0]):
+        if champ not in res and c not in pris and sc > 0:
+            res[champ] = c; pris.add(c)
+    if df is not None:
+        # tiers de secours : 2e meilleure colonne de nom (ex. « Nom » quand « Raison sociale » est vide pour un particulier)
+        sec = [(sc, c) for sc, ch, c in cand if ch == "tiers" and c not in pris and sc > 40
+               and not (profils[c]["n"] >= 3 and profils[c]["distinct"] == 1)]
+        if "tiers" in res and sec:
+            res["tiers2"] = max(sec)[1]; pris.add(res["tiers2"])
+        # champs obligatoires sans intitulé reconnu : on devine par le contenu
+        libres = [c for c in cols if c not in pris]
+        if "date" not in res:
+            ok = [(profils[c]["date"], c) for c in libres if profils[c]["date"] >= 0.8 and not EXCLUS_ENT(norm(c), "date")]
+            if ok: res["date"] = max(ok)[1]; libres.remove(res["date"])
+        if "numero" not in res:
+            ok = [(profils[c]["code"] + profils[c]["distinct"] / max(profils[c]["n"], 1), c) for c in libres
+                  if profils[c]["code"] >= 0.8 and profils[c]["decimal"] < 0.2 and profils[c]["date"] < 0.2
+                  and not EXCLUS_ENT(norm(c), "numero")]
+            if ok: res["numero"] = max(ok)[1]; libres.remove(res["numero"])
+        if "tiers" not in res:
+            ok = [(profils[c]["texte"] + profils[c]["distinct"] / 1000, c) for c in libres
+                  if profils[c]["texte"] >= 0.8 and profils[c]["distinct"] > 1 and profils[c]["mail"] < 0.2
+                  and profils[c]["code"] < 0.3
+                  and not EXCLUS_ENT(norm(c), "tiers")]
+            if ok: res["tiers"] = max(ok)[1]; libres.remove(res["tiers"])
+        if "tiers" not in res and res.get("libelle") and norm(res["libelle"]) in ("intitule", "libelle", "nom", "intitule compte"):
+            pl = profils[res["libelle"]]                        # « Intitulé » seul : c'est le nom du tiers, pas un libellé
+            if pl["texte"] >= 0.8 and pl["code"] < 0.3 and pl["distinct"] > 1:
+                res["tiers"] = res.pop("libelle")
+        # contrôle HT / TVA / TTC : si HT > TTC sur la plupart des lignes, les deux colonnes sont inversées
+        if "ht" in res and "ttc" in res:
+            a = [(montant(x), montant(y)) for x, y in zip(df[res["ht"]].head(100), df[res["ttc"]].head(100))]
+            a = [(x, y) for x, y in a if x is not None and y is not None and x > 0]
+            if a and sum(x > y for x, y in a) > 0.7 * len(a):
+                res["ht"], res["ttc"] = res["ttc"], res["ht"]
     return res
+
+def EXCLUS_ENT(n, champ):
+    return any(x in set(n.split()) for x in EXCLUS.get(champ, []))
 
 def cle_api():
     """Clé API valide ou chaîne vide (ignore les valeurs factices comme sk-ant-...)."""
@@ -122,13 +251,15 @@ def mapping_ia(df, deja):
 CHAMPS_LIBELLES = {"date": "Date de facture", "numero": "N° de facture", "tiers": "Client / Fournisseur",
                    "code_tiers": "Code tiers (facultatif)", "ht": "Montant HT", "tva": "Montant TVA",
                    "ttc": "Montant TTC", "taux_tva": "Taux de TVA", "libelle": "Libellé (facultatif)",
-                   "compte": "Compte comptable (facultatif)"}
+                   "compte": "Compte comptable (facultatif)", "tiers2": "Nom du tiers de secours (si le 1er est vide)"}
+MAPPING_V = 2   # version de la détection automatique : les anciens mappings automatiques sont recalculés
 
 def empreinte(df):
     return hashlib.md5("|".join(map(str, df.columns)).encode()).hexdigest()[:10]
 
 def sauver_mapping(df, m, dossier="mappings"):
     os.makedirs(dossier, exist_ok=True)
+    m = {**{k: v for k, v in m.items() if not k.startswith("_")}, "_manuel": True}
     json.dump(m, open(os.path.join(dossier, f"{empreinte(df)}.json"), "w", encoding="utf-8"), indent=2, ensure_ascii=False)
 
 def exporter_reglages(comptes, tva_comptes, produits_tva=None, tva_nd=None, vehicule=None, dossier="mappings"):
@@ -145,15 +276,21 @@ def importer_reglages(d, dossier="mappings"):
         json.dump(m, open(os.path.join(dossier, f"{emp}.json"), "w", encoding="utf-8"), indent=2, ensure_ascii=False)
     return d.get("comptes"), d.get("tva_comptes"), d.get("produits_tva"), d.get("tva_nd"), d.get("vehicule")
 
-def charger_mapping(df, dossier="mappings"):
+def charger_mapping(df, dossier="mappings", type_=None):
+    """Mapping mémorisé à la main (prioritaire) sinon détection automatique (recalculée si la détection a évolué)."""
+    if all(c in df.columns for c in COLONNES_STD):              # tableau produit par la lecture PDF / XML : colonnes connues
+        return dict(zip(["date", "numero", "tiers", "ht", "taux_tva", "tva", "ttc"], COLONNES_STD))
     chemin = os.path.join(dossier, f"{empreinte(df)}.json")
     if os.path.exists(chemin):
-        print(f"Mapping mémorisé : {chemin}")
-        return json.load(open(chemin, encoding="utf-8"))
-    m = mapping_regles(df.columns)
+        try: m = json.load(open(chemin, encoding="utf-8"))
+        except Exception: m = {}
+        if m.get("_manuel") or (m.get("_v") == MAPPING_V and m.get("_type") == type_):
+            print(f"Mapping mémorisé : {chemin}")
+            return {k: v for k, v in m.items() if not k.startswith("_") and v in df.columns}
+    m = mapping_regles(df.columns, df, type_)
     m.update(mapping_ia(df, m))
     os.makedirs(dossier, exist_ok=True)
-    json.dump(m, open(chemin, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+    json.dump({**m, "_v": MAPPING_V, "_type": type_}, open(chemin, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
     print(f"Mapping détecté et enregistré : {chemin}")
     return m
 
@@ -804,7 +941,8 @@ def colonnes_par_taux(df):
 def vers_pivot(df, m, anomalies, src=""):
     for c in OBLIGATOIRES:
         if c not in m:
-            raise ValueError(f"Colonne obligatoire non détectée : '{c}'. Complétez le fichier mappings/*.json")
+            raise ValueError(f"{src} : colonne « {CHAMPS_LIBELLES[c]} » non trouvée. Choisissez-la dans "
+                             "Réglages → Colonnes des CSV / Excel, puis relancez.")
     lignes, wide = [], colonnes_par_taux(df)
     if len(wide) < 2: wide = {}
     for i, r in df.iterrows():
@@ -812,7 +950,8 @@ def vers_pivot(df, m, anomalies, src=""):
         d = date(r[m["date"]])
         if d is None:
             anomalies.append((n, "Date illisible", r[m["date"]])); continue
-        g = lambda k: (str(r[m[k]]).strip() if k in m and pd.notna(r[m[k]]) else "")
+        g0 = lambda k: (str(r[m[k]]).strip() if k in m and m[k] in r.index and pd.notna(r[m[k]]) and str(r[m[k]]).strip() not in ("nan", "None") else "")
+        g = lambda k: (g0(k) or g0("tiers2")) if k == "tiers" else g0(k)
         page = str(int(float(r["Page"]))) if "Page" in df.columns and pd.notna(r["Page"]) else ""
         if wide:                                              # une colonne HT / TVA par taux : une ligne par taux
             parts = []
@@ -1400,7 +1539,7 @@ def traiter(fichiers, type_="vente", siren="000000000", exercice="", sortie=".",
         anomalies += [(nom, a, b) for a, b in df.attrs.get("anomalies", [])]
         if df.empty:
             anomalies.append((nom, "Aucune facture extraite", "")); continue
-        lignes += vers_pivot(df, (mappings or {}).get(nom) or charger_mapping(df), anomalies, nom)
+        lignes += vers_pivot(df, (mappings or {}).get(nom) or charger_mapping(df, type_=type_), anomalies, nom)
     if not lignes:
         raise ValueError("Aucune écriture exploitable : " + " ; ".join(f"{a[0]} - {a[1]}" for a in anomalies[:3]))
     for l in lignes:                                         # noms de tiers corrigés dans l'app

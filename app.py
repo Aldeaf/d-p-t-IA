@@ -364,7 +364,7 @@ with tab3:
                 df = ag.lire(chemins[nom])
             except Exception as e:
                 st.error(f"Lecture impossible : {e}"); continue
-            detecte = ag.charger_mapping(df)
+            detecte = ag.charger_mapping(df, type_=type_)
             opts = ["(aucune)"] + [str(c) for c in df.columns]
             for champ, lib in ag.CHAMPS_LIBELLES.items():
                 cur = detecte.get(champ)
