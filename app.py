@@ -5,11 +5,22 @@ import streamlit as st
 import agent_fec as ag
 
 st.set_page_config(page_title="Agent Fec", page_icon="🧾")
-st.title("🧾 Agent Fec")
+# Barre d'onglets tout en haut et toujours visible (collée sous l'en-tête de Streamlit pendant le défilement)
+st.markdown("""<style>
+header[data-testid="stHeader"] {height: 2.5rem; min-height: 2.5rem;}
+.block-container {padding-top: 3rem;}
+.stTabs [data-baseweb="tab-list"] {
+    position: sticky; top: 2.5rem; z-index: 999; background-color: #ffffff;
+    padding: 0.25rem 0; border-bottom: 1px solid rgba(128,128,128,0.25); overflow-x: auto;
+}
+.stTabs [data-baseweb="tab"] {font-size: 1rem; padding: 0.4rem 0.8rem;}
+@media (prefers-color-scheme: dark) { .stTabs [data-baseweb="tab-list"] {background-color: #0e1117;} }
+[data-testid="stAppViewContainer"][data-theme="dark"] .stTabs [data-baseweb="tab-list"] {background-color: #0e1117;}
+</style>""", unsafe_allow_html=True)
 ss = st.session_state
 
 # Vérifie que agent_fec.py est bien la dernière version (sinon message clair au lieu d'une erreur masquée)
-_REQUIS = ["VERSION", "CHAMPS_LIBELLES", "importer_reglages", "exporter_reglages", "fusionner_modele", "sauver_mapping", "creer_archive", "extraire_zip", "rapprocher", "produits_par_taux", "preparer_nd", "colonnes_par_taux", "tva_nd_defaut_df", "OBLIGATOIRES", "TVA_COMPTES", "regenerer", "migrer_modele", "VEHICULES", "CARBURANTS", "pct_deductible_carburant", "valider_ecritures", "COLS_ND", "purger_caches", "bornes_exercice", "NOTES"]
+_REQUIS = ["VERSION", "CHAMPS_LIBELLES", "importer_reglages", "exporter_reglages", "fusionner_modele", "sauver_mapping", "creer_archive", "extraire_zip", "rapprocher", "produits_par_taux", "preparer_nd", "colonnes_par_taux", "tva_nd_defaut_df", "OBLIGATOIRES", "TVA_COMPTES", "regenerer", "migrer_modele", "VEHICULES", "CARBURANTS", "pct_deductible_carburant", "valider_ecritures", "COLS_ND", "purger_caches", "bornes_exercice", "NOTES", "apprendre", "appliquer_appris", "fusionner_appris", "charger_appris", "COLS_APPRIS"]
 _manque = [n for n in _REQUIS if not hasattr(ag, n)]
 if _manque:
     st.error("agent_fec.py n'est pas à jour sur GitHub (il manque : " + ", ".join(_manque) +
@@ -100,7 +111,7 @@ def produits_df(d):
 
 AUCUN = "(aucune règle carburant)"
 
-def appliquer_reglages(c, t, p=None, nd=None, veh=None):
+def appliquer_reglages(c, t, p=None, nd=None, veh=None, ap=None):
     for ty, base in (c or {}).items():
         ss[f"cpt_{ty}_tiers"], ss[f"cpt_{ty}_cp"], ss[f"cpt_{ty}_lib"] = base["tiers"], base["charge_produit"], base["libelle_cp"]
         ss[f"cpt_{ty}_jcode"], ss[f"cpt_{ty}_jlib"] = base["journal"][0], base["journal"][1]
@@ -113,6 +124,10 @@ def appliquer_reglages(c, t, p=None, nd=None, veh=None):
     if nd:
         ss.nd_base = pd.DataFrame(nd, columns=ag.COLS_ND)
         ss.pop("ed_nd", None)
+    if ap:
+        ss.appris = ag.fusionner_appris(ss.get("appris_courant", ss.get("appris")), ap)
+        ss.appris_courant = ss.appris
+        ss.pop("ed_appris", None)
     if veh:
         if veh.get("vehicule") in ag.VEHICULES: ss.veh_type = veh["vehicule"]
         if veh.get("carburant") in ag.CARBURANTS or veh.get("carburant") == AUCUN: ss.veh_carb = veh["carburant"]
@@ -124,6 +139,7 @@ if "init" not in ss:
     ss.tva_base = tva_df(ag.TVA_COMPTES)
     ss.prod_base = produits_df(ag.PRODUITS_TVA)
     ss.nd_base = ag.tva_nd_defaut_df()
+    ss.appris = ag.charger_appris()                          # tiers_appris.csv déposé dans GitHub (facultatif)
     if os.path.exists("reglages.json"):                      # réglages sauvegardés dans GitHub
         appliquer_reglages(*ag.importer_reglages(json.load(open("reglages.json", encoding="utf-8"))))
 if "reglages_a_charger" in ss:                               # import demandé dans l'onglet Réglages
@@ -184,27 +200,32 @@ def afficher_piece(e):
         st.warning(f"Aperçu impossible : {ex}")
 
 # ---------- page ----------
-LIBELLES = {"vente": "🧑‍💼 Clients (factures de vente)", "achat": "🏭 Fournisseurs (factures d'achat)"}
-type_ = st.radio("Je traite des…", list(LIBELLES), format_func=LIBELLES.get, horizontal=True)
 import datetime as _dt
-siren = st.text_input("SIREN du dossier", "000000000")
-col1, col2 = st.columns(2)
+tab1, tab2, tab3 = st.tabs(["📄 Traitement", "📒 Imputations", "⚙️ Réglages"])     # tout en haut de la page
+
 def _date_ui(col, label, defaut, cle):
     try: return col.date_input(label, defaut, format="DD/MM/YYYY", key=cle)
     except TypeError: return col.date_input(label, defaut, key=cle)      # anciennes versions de Streamlit
-_an = _dt.date.today().year
-debut_ex = _date_ui(col1, "Début d'exercice", _dt.date(_an, 1, 1), "ex_debut")
-fin_ex = _date_ui(col2, "Fin d'exercice (clôture)", _dt.date(_an, 12, 31), "ex_fin")
-exercice = fin_ex.strftime("%Y%m%d")                       # le FEC est nommé d'après la date de clôture
-_duree = (fin_ex.year - debut_ex.year) * 12 + fin_ex.month - debut_ex.month + 1
-if fin_ex <= debut_ex:
-    st.error("La fin d'exercice doit être postérieure au début.")
-elif _duree > 24:
-    st.warning(f"Exercice de {_duree} mois : la durée maximale est normalement de 24 mois (1er exercice).")
-elif _duree != 12:
-    st.caption(f"Exercice de {_duree} mois.")
+
+with tab1:
+    LIBELLES = {"vente": "🧑‍💼 Clients (factures de vente)", "achat": "🏭 Fournisseurs (factures d'achat)"}
+    type_ = st.radio("Je traite des…", list(LIBELLES), format_func=LIBELLES.get, horizontal=True)
+    siren = st.text_input("SIREN du dossier", "000000000")
+    col1, col2 = st.columns(2)
+    _an = _dt.date.today().year
+    debut_ex = _date_ui(col1, "Début d'exercice", _dt.date(_an, 1, 1), "ex_debut")
+    fin_ex = _date_ui(col2, "Fin d'exercice (clôture)", _dt.date(_an, 12, 31), "ex_fin")
+    exercice = fin_ex.strftime("%Y%m%d")                       # le FEC est nommé d'après la date de clôture
+    _duree = (fin_ex.year - debut_ex.year) * 12 + fin_ex.month - debut_ex.month + 1
+    if fin_ex <= debut_ex:
+        st.error("La fin d'exercice doit être postérieure au début.")
+    elif _duree > 24:
+        st.warning(f"Exercice de {_duree} mois : la durée maximale est normalement de 24 mois (1er exercice).")
+    elif _duree != 12:
+        st.caption(f"Exercice de {_duree} mois.")
 with st.sidebar:
-    st.caption(f"Agent Fec · version {ag.VERSION}")
+    st.markdown("### 🧾 Agent Fec")
+    st.caption(f"Version {ag.VERSION}")
     if st.button("🧹 Effacer mes fichiers et résultats"):
         effacer_tout(); rerun()
     st.caption("🔒 Aucun fichier n'est conservé : vos documents restent dans la mémoire de votre session "
@@ -212,8 +233,6 @@ with st.sidebar:
     cle = st.text_input("Clé API Anthropic (facultative, secours IA)", type="password")
     if cle:
         os.environ["ANTHROPIC_API_KEY"] = cle
-
-tab1, tab2, tab3 = st.tabs(["📄 Traitement", "📒 Imputations", "⚙️ Réglages"])
 
 with tab1:
     st.caption("CSV/Excel : règles · XML Factur-X/UBL · PDF texte : règles · Scans : OCR si installé, sinon IA (clé facultative)")
@@ -270,7 +289,8 @@ with tab1:
                                     vehicule=ss.get("veh_type", "VP"),
                                     carburant=None if (ss.get("veh_carb", "Gazole") == AUCUN or not ss.get("nd_actif", True)) else ss.get("veh_carb", "Gazole"),
                                     comptes_carburant=ss.get("veh_cpt", ag.COMPTE_CARBURANT_DEFAUT),
-                                    ventiler_pieces=ss.get("ventiler_pieces", True)))
+                                    ventiler_pieces=ss.get("ventiler_pieces", True),
+                                    appris=ss.get("appris_courant", ss.appris)))
             ss.err = None
             ss.res_sig = signature
         except ValueError as e:
@@ -354,7 +374,11 @@ with tab1:
                     ss.n_rapp = ss.get("n_rapp", 0) + 1
                     lancer()
                     rerun()
+        if ss.get("msg_appris"):
+            st.success(ss.pop("msg_appris"))
         with st.expander("✏️ Vérifier ou corriger les noms de tiers"):
+            st.caption("🧠 Chaque correction est mémorisée (SIREN / n° TVA, IBAN, code client ou nom mal lu) "
+                       "et appliquée automatiquement aux prochaines factures du même tiers.")
             fac = pd.DataFrame(r["factures"])
             ed = st.data_editor(fac[["fichier", "numero", "tiers"]], hide_index=True, use_container_width=True,
                                 disabled=["fichier", "numero"], key=f"ed_tiers_{ss.get('n_tiers', 0)}")
@@ -365,6 +389,14 @@ with tab1:
                     if nouveau and nouveau != str(fac.loc[i, "tiers"]).strip():
                         corr[fac.loc[i, "cle"]] = nouveau
                 ss.tiers_corriges = corr
+                if ss.get("apprendre_tiers", True):
+                    nouvelles = ag.apprendre(r["factures"], corr, type_, siren.strip())
+                    if nouvelles:
+                        ss.appris = ag.fusionner_appris(ss.get("appris_courant", ss.appris), nouvelles)
+                        ss.appris_courant = ss.appris
+                        ss.pop("ed_appris", None)
+                        ss.msg_appris = (f"🧠 {len(nouvelles)} élément(s) mémorisé(s) pour reconnaître ces tiers la prochaine fois "
+                                         "(onglet Imputations → Tiers appris).")
                 ss.n_tiers = ss.get("n_tiers", 0) + 1
                 lancer()
                 rerun()
@@ -468,6 +500,25 @@ with tab1:
 
 
 with tab2:
+    with st.expander("🧠 Tiers appris (corrections mémorisées)", expanded=False):
+        st.checkbox("Mémoriser mes corrections de noms de tiers", value=True, key="apprendre_tiers")
+        st.caption("Clé : siren:… (SIREN / SIRET / n° TVA), iban:…, codecli:… (code client), code:… (colonne code tiers "
+                   "du fichier) ou nom:… (nom mal lu). Supprimez une ligne pour oublier une correction.")
+        ss.appris_courant = st.data_editor(ss.appris, num_rows="dynamic", hide_index=True, use_container_width=True,
+                                           key="ed_appris")
+        st.download_button("⬇️ Télécharger (tiers_appris.csv)",
+                           ss.appris_courant.to_csv(index=False, sep=";").encode("utf-8"),
+                           file_name="tiers_appris.csv", mime="text/csv")
+        ua = st.file_uploader("Importer tiers_appris.csv", type="csv", key="appris_up")
+        if ua is not None and ss.get("appris_nom") != (ua.name, ua.size):
+            with atelier() as (d, _):
+                ch = os.path.join(d, "tiers_appris.csv")
+                with open(ch, "wb") as fh: fh.write(ua.getvalue())
+                ss.appris = ag.fusionner_appris(ss.appris_courant, ag.charger_appris(ch).to_dict("records"))
+            ss.appris_nom = (ua.name, ua.size); ss.appris_courant = ss.appris
+            ss.pop("ed_appris", None); rerun()
+        st.caption("Pour la garder d'une session à l'autre : ajoutez tiers_appris.csv à la racine de GitHub "
+                   "(ou utilisez la sauvegarde des réglages), elle sera rechargée au démarrage.")
     st.caption("Si le nom du tiers contient le motif, le compte est utilisé. Colonne type : achat, vente, ou vide pour les deux. "
                "Les règles du modèle sont indicatives : vérifiez-les avec le plan comptable du dossier.")
     if st.button("➕ Ajouter les fournisseurs courants du modèle"):
@@ -577,7 +628,8 @@ with tab3:
         st.download_button("⬇️ Télécharger mes réglages (reglages.json)",
                            json.dumps(ag.exporter_reglages(c, t, p, ss.get("nd_courant", ss.nd_base).to_dict("records"),
                                                    {"vehicule": ss.get("veh_type", "VP"), "carburant": ss.get("veh_carb", "Gazole"),
-                                                    "comptes": ss.get("veh_cpt", ag.COMPTE_CARBURANT_DEFAUT)}), ensure_ascii=False, indent=2).encode("utf-8"),
+                                                    "comptes": ss.get("veh_cpt", ag.COMPTE_CARBURANT_DEFAUT)},
+                                                   appris=ss.get("appris_courant", ss.appris).to_dict("records")), ensure_ascii=False, indent=2).encode("utf-8"),
                            file_name="reglages.json", mime="application/json")
         st.caption("Pour les garder : ajoutez ce fichier à la racine de GitHub, il sera rechargé au démarrage.")
         rg = st.file_uploader("Restaurer des réglages (reglages.json)", type="json", key="reg_up")

@@ -12,7 +12,7 @@ PDF/images : Factur-X (XML intégré) -> texte du PDF (règles) -> OCR PaddleOCR
 -> IA Claude (facultatif, payant, si ANTHROPIC_API_KEY est défini).
 """
 import argparse, hashlib, io, json, os, re, shutil, sys, tempfile, unicodedata, zipfile
-VERSION = "2026.11.06-t"
+VERSION = "2026.11.06-u"
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from decimal import Decimal, ROUND_HALF_UP
@@ -262,19 +262,20 @@ def sauver_mapping(df, m, dossier="mappings"):
     m = {**{k: v for k, v in m.items() if not k.startswith("_")}, "_manuel": True}
     json.dump(m, open(os.path.join(dossier, f"{empreinte(df)}.json"), "w", encoding="utf-8"), indent=2, ensure_ascii=False)
 
-def exporter_reglages(comptes, tva_comptes, produits_tva=None, tva_nd=None, vehicule=None, dossier="mappings"):
+def exporter_reglages(comptes, tva_comptes, produits_tva=None, tva_nd=None, vehicule=None, dossier="mappings", appris=None):
     """Tout ce qui se règle dans l'app, dans un dictionnaire sauvegardable (JSON)."""
     maps = {}
     if os.path.isdir(dossier):
         for f in os.listdir(dossier):
             if f.endswith(".json"): maps[f[:-5]] = json.load(open(os.path.join(dossier, f), encoding="utf-8"))
-    return {"comptes": comptes, "tva_comptes": tva_comptes, "produits_tva": produits_tva, "tva_nd": tva_nd, "vehicule": vehicule, "mappings": maps}
+    return {"comptes": comptes, "tva_comptes": tva_comptes, "produits_tva": produits_tva, "tva_nd": tva_nd, "vehicule": vehicule,
+            "mappings": maps, "tiers_appris": appris}
 
 def importer_reglages(d, dossier="mappings"):
     os.makedirs(dossier, exist_ok=True)
     for emp, m in (d.get("mappings") or {}).items():
         json.dump(m, open(os.path.join(dossier, f"{emp}.json"), "w", encoding="utf-8"), indent=2, ensure_ascii=False)
-    return d.get("comptes"), d.get("tva_comptes"), d.get("produits_tva"), d.get("tva_nd"), d.get("vehicule")
+    return d.get("comptes"), d.get("tva_comptes"), d.get("produits_tva"), d.get("tva_nd"), d.get("vehicule"), d.get("tiers_appris")
 
 def charger_mapping(df, dossier="mappings", type_=None):
     """Mapping mémorisé à la main (prioritaire) sinon détection automatique (recalculée si la détection a évolué)."""
@@ -291,6 +292,112 @@ def charger_mapping(df, dossier="mappings", type_=None):
     m = mapping_regles(df.columns, df, type_)                     # détection en mémoire, rien n'est écrit
     m.update(mapping_ia(df, m))
     return m
+
+# ---------- Apprentissage des corrections de tiers ----------
+COLS_APPRIS = ["type", "cle", "nom"]
+
+def _luhn(n):
+    t = 0
+    for i, c in enumerate(reversed(n)):
+        d = int(c) * (2 if i % 2 else 1)
+        t += d - 9 if d > 9 else d
+    return t % 10 == 0
+
+def _iban_ok(i):
+    i = re.sub(r"\s", "", i).upper()
+    if not re.fullmatch(r"[A-Z]{2}\d{2}[A-Z0-9]{10,30}", i): return False
+    r = i[4:] + i[:4]
+    return int("".join(str(int(c, 36)) for c in r)) % 97 == 1
+
+def identifiants(texte, type_):
+    """Identifiants propres au TIERS lus sur une facture : SIREN (via SIRET / SIREN / n° TVA / RCS), IBAN, code client.
+    Ventes : seuls ceux d'une ligne « client » (les autres sont ceux de votre société). Achats : ceux de l'émetteur
+    (on écarte les lignes « client / acheteur », qui vous concernent)."""
+    ids = set()
+    for l in _norm_txt(texte).splitlines():
+        ligne_client = re.search(r"client|acheteur|destinataire|customer|buyer|factur[ée]e?\s*[àa]", l, re.I)
+        if (type_ == "vente") != bool(ligne_client): continue
+        for m in re.finditer(r"(?<!\d)(\d{3})[ .]?(\d{3})[ .]?(\d{3})(?:[ .]?(\d{5}))?(?!\d)", l):
+            if re.search(r"siret|siren|rcs|tva|vat|immatricul|\bsir", l, re.I):
+                sn = "".join(m.group(i) for i in (1, 2, 3))
+                if _luhn(sn) and sn != "000000000": ids.add("siren:" + sn)
+        for m in re.finditer(r"\bFR\s?[0-9A-Z]{2}\s?(\d{3})\s?(\d{3})\s?(\d{3})\b", l):
+            sn = "".join(m.groups())
+            if _luhn(sn): ids.add("siren:" + sn)
+        for m in re.finditer(r"\b([A-Z]{2}\d{2}(?:\s?[A-Z0-9]{4}){3,7}(?:\s?[A-Z0-9]{1,4})?)\b", l):
+            if type_ == "achat" and _iban_ok(m.group(1)): ids.add("iban:" + re.sub(r"\s", "", m.group(1)).upper())
+        m = re.search(r"(?:code|n[°º]|num[ée]ro|r[ée]f(?:[ée]rence)?|compte)\s*client\s*:?\s*([A-Z0-9][A-Z0-9\-/.]{1,19})|"
+                      r"client\s*(?:n[°º]|no\.?|num[ée]ro|code)\s*:?\s*([A-Z0-9][A-Z0-9\-/.]{1,19})", l, re.I)
+        if m and re.search(r"\d", m.group(1) or m.group(2)):
+            ids.add("codecli:" + norm(m.group(1) or m.group(2)).replace(" ", ""))
+    return sorted(ids)
+
+def _cles_facture(f, siren=""):
+    cles = [k for k in f.get("ids", []) if k != f"siren:{siren}"]
+    lu = " ".join(norm(f.get("tiers_lu", "")).split())
+    if lu and lu != "a identifier" and len(lu) >= 3: cles.append("nom:" + lu)
+    return cles
+
+def apprendre(factures, corrections, type_, siren=""):
+    """Entrées à mémoriser pour les corrections faites par l'utilisateur. Un identifiant présent sur une autre facture
+    du lot avec un autre tiers n'est pas appris (c'est sans doute celui de votre société, commun à tout le lot)."""
+    finals = {f["cle"]: (corrections.get(f["cle"]) or f["tiers"]) for f in factures}
+    out = []
+    for f in factures:
+        nom = (corrections.get(f["cle"]) or "").strip()
+        if not nom: continue
+        cles = _cles_facture(f, siren)
+        if any(not k.startswith("nom:") for k in cles):           # identifiant fiable : le nom mal lu n'est pas appris
+            cles = [k for k in cles if not k.startswith("nom:")]
+        for k in cles:
+            partage = any(k in _cles_facture(g, siren) and norm(finals[g["cle"]]) != norm(nom)
+                          for g in factures if g["cle"] != f["cle"])
+            if not partage and not (k.startswith("nom:") and k[4:] == " ".join(norm(nom).split())):
+                out.append({"type": type_, "cle": k, "nom": nom})
+    return out
+
+def fusionner_appris(table, nouvelles):
+    """Ajoute / remplace (même type + même clé) dans la table des tiers appris."""
+    df = pd.DataFrame(table if table is not None else [], columns=COLS_APPRIS)
+    if isinstance(table, pd.DataFrame): df = table[COLS_APPRIS].copy()
+    for e in nouvelles:
+        df = df[~((df["type"] == e["type"]) & (df["cle"] == e["cle"]))]
+        df = pd.concat([df, pd.DataFrame([e])[COLS_APPRIS]], ignore_index=True)
+    return df.reset_index(drop=True)
+
+def charger_appris(chemin="tiers_appris.csv"):
+    if not os.path.exists(chemin): return pd.DataFrame(columns=COLS_APPRIS)
+    df = pd.read_csv(chemin, sep=";", dtype=str).fillna("")
+    for c in COLS_APPRIS:
+        if c not in df.columns: df[c] = ""
+    return df[COLS_APPRIS]
+
+def appliquer_appris(lignes, appris, type_, siren, anomalies):
+    """Remplace le tiers lu par le tiers mémorisé quand un identifiant de la facture est connu.
+    Priorité aux identifiants (SIREN, IBAN, code client) sur le nom lu ; plusieurs tiers possibles -> alerte, rien n'est changé."""
+    if appris is None or len(appris) == 0: return
+    df = appris if isinstance(appris, pd.DataFrame) else pd.DataFrame(appris, columns=COLS_APPRIS)
+    idx = {}
+    for _, r in df.iterrows():
+        if str(r["type"]).strip() in ("", type_) and str(r["cle"]).strip() and str(r["nom"]).strip():
+            idx.setdefault(str(r["cle"]).strip(), set()).add(str(r["nom"]).strip())
+    groupes = OrderedDict()
+    for l in lignes: groupes.setdefault(f"{l['n'].rsplit(':', 1)[0]}|{l['numero']}", []).append(l)
+    for cle, ls in groupes.items():
+        f = {"ids": ls[0].get("ids", []), "tiers_lu": ls[0].get("tiers_lu", ls[0]["tiers"])}
+        cles = _cles_facture(f, siren)
+        for groupe in ([k for k in cles if not k.startswith("nom:")], [k for k in cles if k.startswith("nom:")]):
+            noms = set().union(*[idx[k] for k in groupe if k in idx]) if any(k in idx for k in groupe) else set()
+            if len(noms) == 1:
+                nom = noms.pop()
+                if norm(nom) != norm(ls[0]["tiers"]):
+                    via = ", ".join(k.split(":", 1)[0].replace("codecli", "code client").upper() for k in groupe if k in idx)
+                    for l in ls: l["tiers"], l["code"] = nom, ""
+                    anomalies.append((ls[0]["n"], f"Tiers reconnu grâce à une correction mémorisée ({via}) : {nom}", ls[0]["numero"]))
+                break
+            if len(noms) > 1:
+                anomalies.append((ls[0]["n"], f"Plusieurs tiers mémorisés possibles ({', '.join(sorted(noms))[:80]}) : vérifiez", ls[0]["numero"]))
+                break
 
 # ---------- Lecture & conversions ----------
 COLONNES_STD = ["Date facture", "N° facture", "Client", "Total HT", "Taux TVA", "Total TVA", "Total TTC"]
@@ -1054,9 +1161,10 @@ def lire_texte(texte, type_, nom, blocs=None):
     if not tiers:
         tiers = "A IDENTIFIER"; anom.append(("Tiers non identifié", numero))
     d = _date_texte(t)
+    ids = ";".join(identifiants(texte, type_))
     df = pd.DataFrame([{"Date facture": d, "N° facture": numero, "Client": tiers, "Total HT": str(sg * b),
-                        "Taux TVA": taux_str(r), "Total TVA": str(sg * v), "Total TTC": str(sg * (b + v))}
-                       for r, b, v in vent], columns=COLONNES_STD)
+                        "Taux TVA": taux_str(r), "Total TVA": str(sg * v), "Total TTC": str(sg * (b + v)), "Ids": ids}
+                       for r, b, v in vent], columns=COLONNES_STD + ["Ids"])
     df.attrs["anomalies"], df.attrs["numero_trouve"] = anom, trouve
     return df
 
@@ -1209,6 +1317,9 @@ def vers_pivot(df, m, anomalies, src=""):
         g0 = lambda k: (str(r[m[k]]).strip() if k in m and m[k] in r.index and pd.notna(r[m[k]]) and str(r[m[k]]).strip() not in ("nan", "None") else "")
         g = lambda k: (g0(k) or g0("tiers2")) if k == "tiers" else g0(k)
         page = str(int(float(r["Page"]))) if "Page" in df.columns and pd.notna(r["Page"]) else ""
+        ids_l = [x for x in str(r["Ids"]).split(";") if x and x != "nan"] if "Ids" in df.columns and pd.notna(r["Ids"]) else []
+        if "code_tiers" in m and pd.notna(r[m["code_tiers"]]) and str(r[m["code_tiers"]]).strip():
+            ids_l.append("code:" + norm(r[m["code_tiers"]]).replace(" ", ""))
         if wide:                                              # une colonne HT / TVA par taux : une ligne par taux
             parts = []
             for t, cols in wide.items():
@@ -1224,7 +1335,7 @@ def vers_pivot(df, m, anomalies, src=""):
                     anomalies.append((n, f"Colonnes par taux : HT+TVA ({tot}) <> TTC ({ttc_row})", g("numero")))
                 for t, h, v in parts:
                     lignes.append(dict(n=n, date=d, numero=g("numero"), tiers=g("tiers"), code=g("code_tiers"),
-                                       libelle=g("libelle"), compte=g("compte"), page=page, ht=h, tva=v, ttc=h + v, taux=t))
+                                       libelle=g("libelle"), compte=g("compte"), page=page, ht=h, tva=v, ttc=h + v, taux=t, ids=ids_l))
                 continue
         ht = montant(r[m["ht"]]) if "ht" in m else None
         tva = montant(r[m["tva"]]) if "tva" in m else None
@@ -1243,7 +1354,7 @@ def vers_pivot(df, m, anomalies, src=""):
             taux = (tva / ht * 100).quantize(Decimal("0.1")) if ht else Decimal("0")
         lignes.append(dict(n=n, date=d, numero=g("numero"), tiers=g("tiers"), code=g("code_tiers"),
                            libelle=g("libelle"), compte=g("compte"), page=page, ht=ht, tva=tva, ttc=ttc,
-                           taux=taux_str(taux)))
+                           taux=taux_str(taux), ids=ids_l))
     return lignes
 
 # ---------- Table d'imputation (fournisseur/client -> compte) ----------
@@ -1414,7 +1525,8 @@ def msg_cadeau():
     return (f"Cadeau : TVA déductible seulement si la valeur est ≤ {SEUIL_CADEAU} € TTC par bénéficiaire et par an "
             "(seuil à vérifier pour l'année) ; au-delà, TVA non déductible. Relevé n° 2067 si le total des cadeaux dépasse 3 000 €.")
 
-INFOS = ("TVA non déductible appliquée", "Ventilation TVA lue sur la pièce", "Contrôle des montants impossible")      # messages informatifs : non surlignés
+INFOS = ("TVA non déductible appliquée", "Ventilation TVA lue sur la pièce", "Contrôle des montants impossible",
+         "Tiers reconnu grâce à une correction mémorisée")      # messages informatifs : non surlignés
 
 NOTES = ("Pièce antérieure à l'exercice", "Pièce de l'exercice suivant")   # remarques : surlignage vert pâle
 
@@ -1965,7 +2077,7 @@ def traiter(*args, **kwargs):
 def _traiter(fichiers, type_="vente", siren="000000000", exercice="", sortie=".", regles=None,
             mappings=None, comptes=None, tva_comptes=None, separateur="tab", tiers_corriges=None, pieces=None, rapprochements=None, produits_tva=None, tva_nd=None, tiers_au_compte=True, ventilations=None,
             vehicule="VP", carburant="Gazole", comptes_carburant=COMPTE_CARBURANT_DEFAUT, ventiler_pieces=True,
-            debut_exercice=None):
+            debut_exercice=None, appris=None):
     anomalies, lignes = [], []
     for f in fichiers:
         nom = os.path.basename(f)
@@ -1979,6 +2091,8 @@ def _traiter(fichiers, type_="vente", siren="000000000", exercice="", sortie="."
         lignes += vers_pivot(df, (mappings or {}).get(nom) or charger_mapping(df, type_=type_), anomalies, nom)
     if not lignes:
         raise ValueError("Aucune écriture exploitable : " + " ; ".join(f"{a[0]} - {a[1]}" for a in anomalies[:3]))
+    for l in lignes: l["tiers_lu"] = l["tiers"]
+    appliquer_appris(lignes, appris, type_, siren, anomalies)  # tiers reconnus grâce aux corrections mémorisées
     for l in lignes:                                         # noms de tiers corrigés dans l'app
         cle = f"{l['n'].rsplit(':', 1)[0]}|{l['numero']}"
         if (tiers_corriges or {}).get(cle):
@@ -2027,7 +2141,8 @@ def _traiter(fichiers, type_="vente", siren="000000000", exercice="", sortie="."
             anomalies.append((cle.split("|")[0], f"TVA ({tva_s}) ne correspond à aucun taux unique : facture multi-taux à ventiler", inv[0]["numero"]))
     factures = list(OrderedDict(((f"{l['n'].rsplit(':', 1)[0]}|{l['numero']}"),
                                  {"cle": f"{l['n'].rsplit(':', 1)[0]}|{l['numero']}", "fichier": l["n"].rsplit(":", 1)[0],
-                                  "numero": l["numero"], "tiers": l["tiers"]}) for l in lignes).values())
+                                  "numero": l["numero"], "tiers": l["tiers"], "tiers_lu": l.get("tiers_lu", l["tiers"]),
+                                  "ids": l.get("ids", [])}) for l in lignes).values())
     ecr = construire_ecritures(lignes, type_, anomalies,
                                preparer_regles(regles if regles is not None else charger_imputations()),
                                comptes, tva_comptes, produits_tva,
