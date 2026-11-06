@@ -31,7 +31,7 @@ header[data-testid="stHeader"] {height: 2.5rem; min-height: 2.5rem;}
 ss = st.session_state
 
 # Vérifie que agent_fec.py est bien la dernière version (sinon message clair au lieu d'une erreur masquée)
-_REQUIS = ["VERSION", "CHAMPS_LIBELLES", "importer_reglages", "exporter_reglages", "fusionner_modele", "sauver_mapping", "creer_archive", "extraire_zip", "rapprocher", "produits_par_taux", "preparer_nd", "colonnes_par_taux", "tva_nd_defaut_df", "OBLIGATOIRES", "TVA_COMPTES", "regenerer", "migrer_modele", "VEHICULES", "CARBURANTS", "pct_deductible_carburant", "valider_ecritures", "COLS_ND", "purger_caches", "bornes_exercice", "NOTES", "apprendre", "appliquer_appris", "fusionner_appris", "charger_appris", "COLS_APPRIS"]
+_REQUIS = ["VERSION", "CHAMPS_LIBELLES", "importer_reglages", "exporter_reglages", "fusionner_modele", "sauver_mapping", "creer_archive", "extraire_zip", "rapprocher", "produits_par_taux", "preparer_nd", "colonnes_par_taux", "tva_nd_defaut_df", "OBLIGATOIRES", "TVA_COMPTES", "regenerer", "migrer_modele", "VEHICULES", "CARBURANTS", "pct_deductible_carburant", "valider_ecritures", "COLS_ND", "purger_caches", "bornes_exercice", "NOTES", "apprendre", "appliquer_appris", "fusionner_appris", "charger_appris", "COLS_APPRIS", "IMMOS", "COMPTE_TVA_IMMO", "societe_presente", "ma_societe"]
 _manque = [n for n in _REQUIS if not hasattr(ag, n)]
 if _manque:
     st.error("agent_fec.py n'est pas à jour sur GitHub (il manque : " + ", ".join(_manque) +
@@ -126,7 +126,7 @@ else:
 
 def effacer_tout():
     """Efface fichiers, résultats et corrections de la session (les réglages sont conservés)."""
-    for k in ("mem", "zips", "res", "err", "cache", "tiers_corriges", "ventilations", "rapp_manuels", "res_sig", "nouv_regles"):
+    for k in ("immos", "mem", "zips", "res", "err", "cache", "tiers_corriges", "ventilations", "rapp_manuels", "res_sig", "nouv_regles"):
         ss.pop(k, None)
     ss.up_key = ss.get("up_key", 0) + 1                      # vide aussi la zone de dépôt
     ag.purger_caches()
@@ -172,9 +172,15 @@ if "init" not in ss:
     ss.nd_base = ag.tva_nd_defaut_df()
     ss.appris = ag.charger_appris()                          # tiers_appris.csv déposé dans GitHub (facultatif)
     if os.path.exists("reglages.json"):                      # réglages sauvegardés dans GitHub
-        appliquer_reglages(*ag.importer_reglages(json.load(open("reglages.json", encoding="utf-8"))))
+        _d = json.load(open("reglages.json", encoding="utf-8"))
+        appliquer_reglages(*ag.importer_reglages(_d))
+        for _k in ("siren", "societe"):
+            if (_d.get("dossier") or {}).get(_k): ss["dossier_" + _k] = ss["in_" + _k] = _d["dossier"][_k]
 if "reglages_a_charger" in ss:                               # import demandé dans l'onglet Réglages
-    appliquer_reglages(*ag.importer_reglages(ss.pop("reglages_a_charger")))
+    _d = ss.pop("reglages_a_charger")
+    appliquer_reglages(*ag.importer_reglages(_d))
+    for _k in ("siren", "societe"):
+        if (_d.get("dossier") or {}).get(_k): ss["dossier_" + _k] = ss["in_" + _k] = _d["dossier"][_k]
 
 def comptes_ui():
     c = {}
@@ -254,7 +260,13 @@ def _date_ui(col, label, defaut, cle):
 with tab1:
     LIBELLES = {"vente": "🧑‍💼 Clients (factures de vente)", "achat": "🏭 Fournisseurs (factures d'achat)"}
     type_ = st.radio("Je traite des…", list(LIBELLES), format_func=LIBELLES.get, horizontal=True)
-    siren = st.text_input("SIREN du dossier", "000000000")
+    cs1, cs2 = st.columns([1, 2])
+    siren = cs1.text_input("SIREN du dossier", ss.get("dossier_siren", "000000000"), key="in_siren")
+    societe = cs2.text_input("Nom de l'entreprise du dossier", ss.get("dossier_societe", ""), key="in_societe",
+                             placeholder="Raison sociale ; enseigne (séparés par ;)",
+                             help="Contrôle que votre entreprise figure bien sur chaque facture (destinataire des achats, "
+                                  "émetteur des ventes) ; votre nom ne sera jamais pris pour un client ou un fournisseur.")
+    ss.dossier_siren, ss.dossier_societe = siren, societe
     col1, col2 = st.columns(2)
     _an = _dt.date.today().year
     debut_ex = _date_ui(col1, "Début d'exercice", _dt.date(_an, 1, 1), "ex_debut")
@@ -317,7 +329,7 @@ with tab1:
         st.caption(f"{len(tabulaires)} fichier(s) comptable(s) · {len(docs)} PDF/image(s) · "
                    + ("les PDF servent de pièces justificatives." if pieces_noms else "les PDF sont lus comme des factures."))
 
-    signature = (type_, siren.strip(), str(debut_ex), str(fin_ex), tuple(sorted(chemins)), tuple(sorted(pieces_noms)))
+    signature = (type_, siren.strip(), societe.strip(), str(debut_ex), str(fin_ex), tuple(sorted(chemins)), tuple(sorted(pieces_noms)))
 
     def lancer():
         c, t, p = comptes_ui()
@@ -334,7 +346,9 @@ with tab1:
                                     carburant=None if (ss.get("veh_carb", "Gazole") == AUCUN or not ss.get("nd_actif", True)) else ss.get("veh_carb", "Gazole"),
                                     comptes_carburant=ss.get("veh_cpt", ag.COMPTE_CARBURANT_DEFAUT),
                                     ventiler_pieces=ss.get("ventiler_pieces", True),
-                                    appris=ss.get("appris_courant", ss.appris)))
+                                    appris=ss.get("appris_courant", ss.appris),
+                                    immobilisations=ss.get("immos") or None, societe=societe,
+                                    compte_tva_immo=(ss.get("cpt_tva_immo") or ag.COMPTE_TVA_IMMO).strip()))
             ss.err = None
             ss.res_sig = signature
         except ValueError as e:
@@ -471,6 +485,38 @@ with tab1:
                 st.dataframe(pd.DataFrame(infos_l, columns=["Fichier:ligne", "Information", "Détail"]), use_container_width=True, hide_index=True)
         if r.get("rapport_octets"):
             st.download_button("Télécharger le rapport", r["rapport_octets"], file_name="rapport_anomalies.csv")
+        if type_ == "achat" and r.get("factures"):
+            sugg = {a[2] for a in r["anomalies"] if a[1].startswith("Immobilisation ?")}
+            immos = ss.get("immos", {})
+            with st.expander(f"🏗️ Immobilisations{f' · 💡 {len(sugg)} à examiner' if sugg else ''}"
+                             f"{f' · {len(immos)} cochée(s)' if immos else ''}", expanded=bool(sugg) and not immos):
+                st.caption("Cochez « Immo » pour un bien durable : la charge devient un compte d'immobilisation (classe 2) et la TVA "
+                           "passe en TVA sur immobilisations. Tolérance fiscale : un bien de moins de 500 € HT (petit matériel, "
+                           "mobilier de bureau, logiciel) peut rester en charge ; au-delà, il s'immobilise. Véhicule de tourisme (VP) : "
+                           "TVA non récupérable, intégrée au coût.")
+                options = [f"{k} · {v}" for k, v in ag.IMMOS.items()]
+                lib = {k: f"{k} · {v}" for k, v in ag.IMMOS.items()}
+                fac_i = r["factures"]
+                df_i = pd.DataFrame({
+                    "immo": [f["cle"] in immos for f in fac_i],
+                    "💡": ["≥ 500 € HT" if f["numero"] in sugg else "" for f in fac_i],
+                    "numero": [f["numero"] for f in fac_i], "tiers": [f["tiers"] for f in fac_i],
+                    "HT": [float(f.get("ht") or 0) for f in fac_i],
+                    "compte": [lib.get(immos.get(f["cle"], "218300"), immos.get(f["cle"], "218300")) for f in fac_i]})
+                df_i = df_i.sort_values(["💡", "HT"], ascending=[False, False])
+                cc = getattr(st, "column_config", None)
+                cfg_i = {"immo": cc.CheckboxColumn("Immo"),
+                         "compte": cc.SelectboxColumn("Compte d'immobilisation", options=options, width="large"),
+                         "HT": cc.NumberColumn("HT", format="%.2f")} if cc else None
+                ed_i = st.data_editor(df_i, column_config=cfg_i, disabled=["💡", "numero", "tiers", "HT"], hide_index=True,
+                                      use_container_width=True, key=f"ed_immo_{ss.get('n_immo', 0)}")
+                st.text_input("Compte de TVA sur immobilisations", ag.COMPTE_TVA_IMMO, key="cpt_tva_immo")
+                if st.button("Appliquer les immobilisations et régénérer le FEC"):
+                    cles_i = [fac_i[i]["cle"] for i in ed_i.index]
+                    ss.immos = {cle: str(c).split(" ")[0].strip() for cle, c, ok in zip(cles_i, ed_i["compte"], ed_i["immo"]) if ok}
+                    ss.n_immo = ss.get("n_immo", 0) + 1
+                    lancer(); rerun()
+
         st.subheader("Écritures")
         ecr = pd.DataFrame(r["ecritures"])
         for k in ("alerte", "note"):
@@ -676,10 +722,12 @@ with tab3:
     with st.expander("💾 Sauvegarde des réglages"):
         c, t, p = comptes_ui()
         st.download_button("⬇️ Télécharger mes réglages (reglages.json)",
-                           json.dumps(ag.exporter_reglages(c, t, p, ss.get("nd_courant", ss.nd_base).to_dict("records"),
+                           json.dumps({**ag.exporter_reglages(c, t, p, ss.get("nd_courant", ss.nd_base).to_dict("records"),
                                                    {"vehicule": ss.get("veh_type", "VP"), "carburant": ss.get("veh_carb", "Gazole"),
                                                     "comptes": ss.get("veh_cpt", ag.COMPTE_CARBURANT_DEFAUT)},
-                                                   appris=ss.get("appris_courant", ss.appris).to_dict("records")), ensure_ascii=False, indent=2).encode("utf-8"),
+                                                   appris=ss.get("appris_courant", ss.appris).to_dict("records")),
+                                       "dossier": {"siren": ss.get("dossier_siren", ""), "societe": ss.get("dossier_societe", "")}},
+                                      ensure_ascii=False, indent=2).encode("utf-8"),
                            file_name="reglages.json", mime="application/json")
         st.caption("Pour les garder : ajoutez ce fichier à la racine de GitHub, il sera rechargé au démarrage.")
         rg = st.file_uploader("Restaurer des réglages (reglages.json)", type="json", key="reg_up")

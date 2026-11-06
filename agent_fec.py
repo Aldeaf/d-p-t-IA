@@ -11,8 +11,8 @@ Le mapping est mémorisé dans mappings/<empreinte>.json (modifiable à la main)
 PDF/images : Factur-X (XML intégré) -> texte du PDF (règles) -> OCR PaddleOCR (facultatif)
 -> IA Claude (facultatif, payant, si ANTHROPIC_API_KEY est défini).
 """
-import argparse, hashlib, io, json, os, re, shutil, sys, tempfile, unicodedata, zipfile
-VERSION = "2026.11.06-y"
+import argparse, hashlib, io, json, os, re, shutil, sys, tempfile, threading, unicodedata, zipfile
+VERSION = "2026.11.06-ab"
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from decimal import Decimal, ROUND_HALF_UP
@@ -333,7 +333,7 @@ def identifiants(texte, type_):
     return sorted(ids)
 
 def _cles_facture(f, siren=""):
-    cles = [k for k in f.get("ids", []) if k != f"siren:{siren}"]
+    cles = [k for k in f.get("ids", []) if k != f"siren:{siren}" and not k.startswith("ms:")]
     lu = " ".join(norm(f.get("tiers_lu", "")).split())
     if lu and lu != "a identifier" and len(lu) >= 3: cles.append("nom:" + lu)
     return cles
@@ -642,11 +642,14 @@ MOTIFS_HT = [r"total\s*" + DEV + r"(?:net\s*)?h\.?\s?t\.?(?![a-z])", r"total\s*h
              r"sous[\s-]?total(?:\s*h\.?\s?t\.?(?![a-z]))?", r"subtotal", r"montant\s*net", r"base\s*h\.?\s?t\.?(?![a-z])"]
 MOTIFS_TTC = [r"total\s*" + DEV + r"(?:g[ée]n[ée]ral\s*)?t\.?t\.?c\.?", r"montant\s*(?:total\s*)?t\.?t\.?c\.?",
               r"total\s*(?:tva\s*(?:incluse|comprise)|toutes?\s*taxes?\s*comprises?)",
-              r"total\s*(?:incl(?:uding|\.)?\s*(?:vat|tax))", r"grand\s*total", r"gross\s*total", r"total\s*gross", r"total\s*amount", r"total\s*due",
-              r"amount\s*due", r"net\s*[àa]\s*payer", r"total\s*[àa]\s*(?:payer|r[ée]gler)", r"[àa]\s*r[ée]gler",
-              r"montant\s*total", r"total\s*g[ée]n[ée]ral"]
+              r"total\s*(?:incl(?:uding|\.)?\s*(?:vat|tax))", r"grand\s*total", r"gross\s*total", r"total\s*gross", r"total\s*amount",
+              r"montant\s*total", r"total\s*g[ée]n[ée]ral", r"total\s*facture"]
+# montants restant dus : peuvent être diminués d'un acompte ou d'un paiement déjà fait -> TTC en dernier recours
+MOTIFS_DU = [r"net\s*[àa]\s*payer", r"total\s*[àa]\s*(?:payer|r[ée]gler)", r"montant\s*[àa]\s*(?:payer|r[ée]gler)", r"[àa]\s*r[ée]gler",
+             r"reste\s*[àa]\s*(?:payer|r[ée]gler)", r"total\s*due", r"amount\s*due", r"balance\s*due", r"solde\s*d[ûu]", r"somme\s*due",
+             r"[àa]\s*payer"]
 MOTIFS_TVA = [r"total\s*t\.?v\.?a\.?", r"montant\s*(?:de\s*la\s*)?t\.?v\.?a\.?", r"total\s*(?:vat|tax(?:es)?)"]
-MOTIF_TOTAL_SEUL = [r"^[ ]*total(?!\s*(?:h|t\.?v|hors|net|g|excl|incl|amount|due))"]
+MOTIF_TOTAL_SEUL = [r"^[ ]*total(?!\s*(?:h|t\.?v|hors|net|g|excl|incl|amount|due|[àa]\s|des\s|r[ée]gl|pay))"]
 
 def _tva_ligne(lignes):
     """Ligne du type 'TVA 20 % : 80,00' : dernier montant à décimales (ignore n° de TVA, mentions d'exonération)."""
@@ -863,7 +866,7 @@ def _numero(texte):
     plaques = _plaques(t)
     for k, (explicite, pat) in enumerate(PATS_NUM):
         for r in re.finditer(pat + TOKEN, t, re.I):
-            c = r.group(1).strip(".-/_,")
+            c = re.sub(r"(?<=\d)(?:DATE|DU|LE|DATED)$", "", r.group(1)).strip(".-/_,")      # « FA9313DATE » (colonne collée)
             if c and k <= 1 and re.fullmatch(r"\d{2}-\d{2}-\d{2,4}", c): return c   # « Facture N° 26-10-50 » : n° au format date
             if not c or re.fullmatch(D_NUM, c) or (re.fullmatch(r"(?:19|20)\d{2}", c) and k > 1) or re.fullmatch(r"\d{9}|\d{14}", c): continue
             seul = re.fullmatch(r"\s*(?:facture|avoir|invoice)\s*:?\s*" + re.escape(r.group(1)) + r"\s*",
@@ -888,7 +891,8 @@ CLIENT_LAB = (r"(?:(?:informations?|infos?|coordonn[ée]es|nom|adresse|identit[�
 ETIQ = {"vente": r"(?:factur[ée]e?\s*[àa]|adresse\s*de\s*facturation|[àa]\s*l'attention\s*de|[àa]\s*destination\s*de|"
                  r"destinataire|" + CLIENT_LAB + r"|customer|bill(?:ed)?\s*to|sold\s*to|adress[ée]e?\s*[àa]|doit|acheteu(?:r|se)|"
                  r"acqu[ée]reu(?:r|se)|donneur\s*d['’]\s*ordre|ma[îi]tre\s*d['’]\s*ouvrage|patient(?:e)?|titulaire\s*du\s*contrat|"
-                 r"titulaire\s*de\s*la\s*ligne|souscripteur|abonn[ée]e?|assur[ée]e?|adh[ée]rent(?:e)?|locataire|[ée]l[èe]ve)",
+                 r"titulaire\s*de\s*la\s*ligne|souscripteur|abonn[ée]e?|assur[ée]e?|adh[ée]rent(?:e)?|locataire|[ée]l[èe]ve|"
+                 r"[àáâa](?=\s*:)|pour(?=\s*:)|to(?=\s*:))",
         "achat": r"(?:fournisseur|[ée]metteur|vendeur|vendu\s*par|prestataire|envoy[ée]e?\s*par|from|seller|supplier)"}
 NON_NOM = (r"^(?:factur\w*|avoir|invoice|devis|date|num[ée]ro|n[°º]|total|page|adresse|adress[ée]\w*|siret|siren|tva|iban|bic|"
            r"t[ée]l|email|e-mail|r[ée]f|code|france|paiement|conditions|mode|ech[ée]ance|objet|d[ée]signation|"
@@ -897,7 +901,7 @@ NON_NOM = (r"^(?:factur\w*|avoir|invoice|devis|date|num[ée]ro|n[°º]|total|pag
            r"doit|[àa]\s*l'attention|[àa]\s*destination)\b")
 RUE = r"(?:rue|avenue|av|bd|boulevard|chemin|impasse|place|all[ée]e|route|cours|quai|zone|za|zi|lotissement|r[ée]sidence)"
 LABELS_EMETTEUR = (r"\s*(?:envoy[ée]e?\s*par|[ée]mise?\s*par|[ée]tablie?\s*par|[ée]metteur|vendeur|vendu\s*par|"
-                   r"fournisseur|prestataire|from|seller|supplier|de\s*la\s*part\s*de)\b")
+                   r"fournisseur|prestataire|from|seller|supplier|de\s*la\s*part\s*de)\b|\s*de\s*(?::|$)")
 LABELS_ACHETEUR = (r"(?:factur[ée]e?\s*[àa]|adress[ée]e?\s*[àa]|adresse\s*de\s*facturation|[àa]\s*l'attention|"
                    r"[àa]\s*destination|destinataire|" + CLIENT_LAB + r"|customer|bill(?:ed)?\s*to|sold\s*to|livr[ée]e?\s*[àa]|"
                    r"ship\s*to|doit|acheteu(?:r|se)|acqu[ée]reu(?:r|se)|donneur\s*d['’]\s*ordre|ma[îi]tre\s*d['’]\s*ouvrage)")
@@ -934,7 +938,8 @@ VOCAB_DEBUT = {"echeance", "echeances", "payer", "reglement", "paiement", "modal
                "libelle", "unite", "conditions", "total", "montant", "mode", "virement", "cheque", "especes", "prelevement",
                "delai", "net", "reste", "somme", "recapitulatif", "designation", "quantite", "prix", "valable", "validite",
                "periode", "frais", "acompte", "solde", "versement", "banque", "rib", "indemnite", "le", "du", "date", "a",
-               "objet", "intervention", "conseiller", "interlocuteur", "votre", "vos", "page"}
+               "objet", "intervention", "conseiller", "interlocuteur", "votre", "vos", "page", "service", "direction",
+               "departement", "pole", "division", "cellule", "bureau", "prise", "lieu", "lieux", "heure", "marque"}
 
 MOTS_LIBELLE = {"titulaire", "contrat", "souscripteur", "abonne", "abonnee", "ligne", "ou", "et", "client", "cliente", "clients", "clientes", "e", "informations", "information", "infos", "info", "coordonnees",
                 "nom", "adresse", "du", "de", "la", "le", "l", "d", "votre", "vos", "notre", "destinataire", "facturation",
@@ -983,6 +988,7 @@ def _nettoyer_nom0(s):
     s = re.split(r"\s{2,}|\s+(?:date|n[°º]|num[ée]ro|r[ée]f|page|t[ée]l|email|e-mail|siret|siren|tva)\b", s, 1, flags=re.I)[0].strip(" :-|")
     s = re.split(r"\s+(?=(?:facture|invoice|avoir|devis)\s*(?:n[°ºo]|num|#|:|\d))", s, 1, flags=re.I)[0].strip(" :-|")   # « Studio X Facture n° 12 »
     s = re.split(rf"\s+(?=(?:{CLIENT_LAB}|destinataire|factur[ée]e?\s*[àa]|doit)\s*:)", s, 1, flags=re.I)[0].strip(" :-|")    # « X Nom du client : Y »
+    s = re.sub(r"(?<=\w)\s+(?:direction|service|d[ée]partement|p[ôo]le|division|cellule|bureau)\b.*$", "", s, flags=re.I).strip(" :-|")
     m_civ = re.search(r"(?<=\w)\s+(?=(?:M\.|Mme|Mlle|Mr\.?|Monsieur|Madame)\s+[A-ZÀ-Ý&])", s)          # 2 colonnes fusionnées
     if m_civ and re.search(r"[A-Za-zÀ-ÿ]{3,}", re.sub(r"\b(?:M\.?|Mme|Mlle|Mr|Monsieur|Madame|et)\b|&", "", s[:m_civ.start()])):
         s = s[:m_civ.start()].strip(" :-|")
@@ -999,14 +1005,63 @@ def _meme_societe(a, b):
 def _emetteur_legal(lignes):
     """Nom de l'émetteur d'après les mentions légales (SIRET, RCS, capital, n° TVA...), en pied de page ou en en-tête."""
     for i, l in enumerate(lignes):
-        if re.search(LEGAL, l, re.I) and not re.match(rf"\s*{LABELS_ACHETEUR}\b", l, re.I):
-            for cand in (re.split(SEP_LEGAL, l, 1, flags=re.I)[0], lignes[i - 1] if i else ""):
+        acheteur = r"\b(?:client(?:e|s)?|acheteu(?:r|se)|destinataire|customer|buyer)\b"
+        if re.search(LEGAL, l, re.I) and not re.match(rf"\s*{LABELS_ACHETEUR}\b", l, re.I) and not re.search(acheteur, l, re.I):
+            prec = lignes[i - 1] if i and not re.search(acheteur, lignes[i - 1], re.I) else ""   # ligne d'avant : pas le bloc client
+            for cand in (re.split(SEP_LEGAL, l, 1, flags=re.I)[0], prec):
                 c = _nettoyer_nom(cand)
                 if c and _nom_valide(c): return c
     return ""
 
 CIVILITE = (r"\b(?:M\.?\s*(?:&|et)\s*Mme|Mme\s*(?:&|et)\s*M\.?|Monsieur\s*(?:&|et)\s*Madame|Madame\s*(?:&|et)\s*Monsieur|"
             r"M\.|Mr\.?|Mme|Mlle|Monsieur|Madame)\s+[A-ZÀ-Ý][\w'’\-]+(?:\s+(?:[A-ZÀ-Ý][\w'’\-]+|de|du|d'|le|la)){0,4}")
+
+_CTX = threading.local()               # entreprise du dossier, propre à chaque session (plusieurs utilisateurs en parallèle)
+
+def ma_societe():
+    """Noms de l'entreprise du dossier (raison sociale ; enseigne…), saisis dans l'appli."""
+    return [n.strip() for n in re.split(r"[;\n]", getattr(_CTX, "societe", "") or "") if len(_compact(n)) >= 3]
+
+def _jetons_nom(n):
+    return [t for t in norm(n).split() if len(t) >= 3 and t not in FORMES and t not in FORMES_DEBUT]
+
+def societe_presente(texte, noms=None, siren=None):
+    """Vrai si l'entreprise du dossier figure sur le document : un de ses noms, ou son SIREN (SIRET / n° TVA)."""
+    noms = ma_societe() if noms is None else noms
+    siren = getattr(_CTX, "siren", "") if siren is None else siren
+    if siren and re.fullmatch(r"\d{9}", siren) and siren != "000000000" and siren in re.sub(r"\D", "", texte): return True
+    tc, tn = _compact(texte), " " + " ".join(norm(texte).split()) + " "
+    for n in noms:
+        cn, jt = _compact(" ".join(_jetons_nom(n))) or _compact(n), _jetons_nom(n)
+        if len(cn) >= 4 and cn in tc: return True
+        if jt and all(f" {t} " in tn for t in jt): return True
+    return False
+
+def _est_ma_societe(c):
+    if not c: return False
+    jc, cc = set(_jetons_nom(c)), _compact(" ".join(_jetons_nom(c)))
+    for n in ma_societe():
+        jn, cn = set(_jetons_nom(n)), _compact(" ".join(_jetons_nom(n)))
+        if (jn and jn <= jc) or (len(cn) >= 4 and (cn == cc or cn in cc)): return True
+    return False
+
+_ACC = {"a": "aàâäá", "e": "eéèêë", "i": "iîïí", "o": "oôöó", "u": "uùûüú", "c": "cç", "y": "yÿ"}
+
+def _motif_souple(mot):
+    """Motif d'un mot insensible aux accents et à la casse (« Rénovation » = « RENOVATION »)."""
+    return "".join(f"[{_ACC[ch]}{_ACC[ch].upper()}]" if ch in _ACC else re.escape(ch) for ch in norm(mot))
+
+def _sans_ma_societe(l):
+    """Retire de la ligne le nom de l'entreprise du dossier (bloc « client » d'une facture d'achat),
+    quels que soient les accents, la casse et la place de la forme juridique (SARL X / X SARL)."""
+    formes = r"(?:" + "|".join(sorted({re.escape(f) for f in FORMES | FORMES_DEBUT if len(f) >= 2}, key=len, reverse=True)) + r")"
+    for n in ma_societe():
+        mots = [_motif_souple(w) for w in _jetons_nom(n)]
+        if not mots: continue
+        coeur = r"[\s.,&'\-]*".join(mots)
+        motif = rf"(?:\b{formes}\.?[\s.]+)?\b{coeur}\b(?:[\s.,]+{formes}\b\.?)?"
+        l = re.sub(motif, "  ", l, flags=re.I)
+    return l
 
 def _compact(x):
     return re.sub(r"[^a-z0-9]", "", norm(x))
@@ -1021,6 +1076,8 @@ def _preuves_emetteur(lignes):
                   "aol", "neuf", "bbox", "protonmail", "gmx"}
     for i, l in enumerate(lignes):
         m = re.match(LABELS_EMETTEUR + r"\s*:?\s*(.*)$", l, re.I)
+        if m and re.search(rf"(?:^|\s){ETIQ['vente']}(?![a-zà-ÿ0-9])\s*:?", m.group(1) or "", re.I):
+            m = None                                            # « De : À: » (colonnes fusionnées) : ligne suivante ambiguë
         if m:                                                   # « Envoyée par » : le nom qui suit est l'émetteur
             for cand in [m.group(1)] + lignes[i + 1:i + 3]:
                 c = _nettoyer_nom(cand)
@@ -1043,8 +1100,11 @@ def _preuves_emetteur(lignes):
 def _est_emetteur(c, preuves):
     if not c: return False
     cc = _compact(c)
+    jc = {t for t in norm(c).split() if len(t) >= 3 and t not in FORMES}
     for n in preuves["noms"]:
-        if _meme_societe(c, n) or (len(cc) >= 4 and (cc in _compact(n) or _compact(n) in cc)): return True
+        jn = {t for t in norm(n).split() if len(t) >= 3 and t not in FORMES}
+        if jn and jc and (jn <= jc or (jc <= jn and len(jn - jc) <= 1)): return True       # même nom (± 1 mot)
+        if len(cc) >= 4 and (_compact(n) in cc or (cc in _compact(n) and len(_compact(n)) - len(cc) <= 4)): return True
     return any(d in cc or (len(cc) >= 4 and cc in d) for d in preuves["domaines"])
 
 def _blocs_haut(fichier, max_pages=10):
@@ -1059,7 +1119,7 @@ def _blocs_haut(fichier, max_pages=10):
                 for w in page.extract_words(keep_blank_chars=False, use_text_flow=False):
                     if float(w["top"]) > 0.45 * H: continue
                     lignes.setdefault(round(float(w["top"]) / 3), []).append(w)
-                gauche, droite = [], []
+                gauche, droite, segs_tous = [], [], []
                 for _, ws in sorted(lignes.items()):
                     ws = sorted(ws, key=lambda w: float(w["x0"]))
                     segs, cur = [], [ws[0]]
@@ -1070,7 +1130,14 @@ def _blocs_haut(fichier, max_pages=10):
                     for sg in segs:
                         txt = " ".join(w["text"] for w in sg)
                         (droite if float(sg[0]["x0"]) >= 0.45 * W else gauche).append(txt)
-                out.append({"gauche": gauche, "droite": droite})
+                        segs_tous.append((float(sg[0]["x0"]), float(sg[0]["top"]), txt))
+                cols = []                                           # colonnes : segments alignés à gauche (± 12 pt)
+                for x0, top, txt in sorted(segs_tous):
+                    c = next((c for c in cols if abs(c["x"] - x0) <= 12), None)
+                    if c is None: c = {"x": x0, "l": []}; cols.append(c)
+                    c["l"].append((top, txt))
+                colonnes = [[t_ for _, t_ in sorted(c["l"])] for c in sorted(cols, key=lambda c: c["x"])]
+                out.append({"gauche": gauche, "droite": droite, "colonnes": colonnes})
     except Exception:
         pass
     return out
@@ -1104,6 +1171,12 @@ def _client_par_position(blocs, preuves, lignes):
     """Client = bloc (gauche ou droit) qui n'est pas celui de l'émetteur ; à défaut le bloc de droite (fenêtre d'enveloppe)."""
     if not blocs: return ""
     g, d = blocs.get("gauche", []), blocs.get("droite", [])
+    premier0 = next((_nettoyer_nom(l) for l in lignes[:3] if _nettoyer_nom(l) and _nom_valide(_nettoyer_nom(l))), "")
+    for col_ in blocs.get("colonnes", []):                        # colonne portant un libellé client (« À : », « Client »…)
+        if any(re.match(rf"\s*{ETIQ['vente']}(?![a-zà-ÿ0-9])", x, re.I) for x in col_[:12]):
+            i0 = next(i for i, x in enumerate(col_[:12]) if re.match(rf"\s*{ETIQ['vente']}(?![a-zà-ÿ0-9])", x, re.I))
+            c = _nom_du_bloc(col_[i0:], preuves)
+            if c and not _est_emetteur(c, preuves): return c
     def emetteur_dans(b):
         return any(_est_emetteur(_nettoyer_nom(x), preuves) or re.search(LEGAL, x, re.I) for x in b[:10])
     premier = next((_nettoyer_nom(l) for l in lignes[:3] if _nettoyer_nom(l) and _nom_valide(_nettoyer_nom(l))), "")
@@ -1153,7 +1226,17 @@ def _entete_tableau(lignes):
     return {}
 
 def _tiers_texte(lignes, type_, blocs=None):
+    if type_ == "achat" and ma_societe():                         # achats : on efface votre nom (bloc destinataire)
+        lignes = [_sans_ma_societe(l) for l in lignes]
+        if blocs: blocs = {k: ([[_sans_ma_societe(x) for x in c] for c in v] if k == "colonnes" else [_sans_ma_societe(x) for x in v])
+                           for k, v in blocs.items()}
+    c = _tiers_texte0(lignes, type_, blocs)
+    return "" if _est_ma_societe(c) else c                          # jamais votre propre entreprise comme tiers
+
+def _tiers_texte0(lignes, type_, blocs=None):
     preuves = _preuves_emetteur(lignes)
+    if type_ == "vente":                                            # ventes : votre entreprise est l'émetteur
+        preuves["noms"] += [n for n in ma_societe() if n not in preuves["noms"]]
     em = preuves["noms"][0] if preuves["noms"] else ""
     pas_emetteur = (lambda c: not _est_emetteur(c, preuves)) if type_ == "vente" else (lambda c: True)
     for i, l in enumerate(lignes):                                  # 1. libellé explicite
@@ -1172,6 +1255,14 @@ def _tiers_texte(lignes, type_, blocs=None):
         if c and _nom_valide(c) and not _est_emetteur(c, preuves): return c
     if type_ == "achat":
         if em: return em
+        for col_ in (blocs or {}).get("colonnes", []):              # colonne « DE / Émetteur » ou portant SIREN / SIRET / TVA
+            lab = next((i for i, x in enumerate(col_[:12]) if re.match(LABELS_EMETTEUR + r"\s*:?\s*$", x, re.I)), None)
+            legal = any(re.search(LEGAL, x, re.I) for x in col_[:14])
+            if lab is None and not legal: continue
+            for x in col_[(lab + 1 if lab is not None else 0):14]:
+                if re.match(rf"\s*{LABELS_ACHETEUR}", x, re.I): break
+                c = _nettoyer_nom(x)
+                if c and _nom_valide(c) and not re.search(r"\d{5}|@|www\.", c): return c
         skip = 0                                                    # 3. sinon 1re ligne hors bloc client
         for l in lignes[:15]:
             if skip: skip -= 1; continue
@@ -1211,6 +1302,14 @@ def lire_texte(texte, type_, nom, blocs=None):
     ht, ttc, tva_exp = _num(t, MOTIFS_HT), _num(t, MOTIFS_TTC), _num(t, MOTIFS_TVA)
     if tva_exp is None: tva_exp = _tva_ligne(lignes)
     if ttc is None: ttc = _num(t, MOTIF_TOTAL_SEUL, dernier=True)
+    du = _num(t, MOTIFS_DU)
+    if ttc is None and du is not None:
+        if ht is not None and tva_exp is not None and abs(ht + tva_exp - du) > Decimal("0.02") and ht + tva_exp > 0:
+            ttc = ht + tva_exp                                   # « à payer » diminué d'un paiement : TTC recalculé
+        else:
+            ttc = du
+    if du is not None and ttc is not None and du < ttc - Decimal("0.01") and ttc > 0:
+        anom.append((f"Reste à payer {du} pour un TTC de {ttc} : paiement ou acompte déjà déduit sur la facture", numero))
     if ht is None or ttc is None:
         h2, t2 = _totaux_tableau(lignes)
         ht = ht if ht is not None else h2; ttc = ttc if ttc is not None else t2
@@ -1257,7 +1356,7 @@ def lire_texte(texte, type_, nom, blocs=None):
     if not tiers:
         tiers = "A IDENTIFIER"; anom.append(("Tiers non identifié", numero))
     d = _date_texte(t) or tab.get("date")
-    ids = ";".join(identifiants(texte, type_))
+    ids = ";".join(identifiants(texte, type_) + ([f"ms:{int(societe_presente(texte))}"] if ma_societe() else []))
     df = pd.DataFrame([{"Date facture": d, "N° facture": numero, "Client": tiers, "Total HT": str(sg * b),
                         "Taux TVA": taux_str(r), "Total TVA": str(sg * v), "Total TTC": str(sg * (b + v)), "Ids": ids}
                        for r, b, v in vent], columns=COLONNES_STD + ["Ids"])
@@ -1290,7 +1389,7 @@ def lire_pdf(fichier, type_="vente"):
         df = lire_facturx(fichier, type_)
         if df is not None: return df
         variantes = textes_pdf(fichier)
-        blocs = _blocs_haut(fichier) if type_ == "vente" else []
+        blocs = _blocs_haut(fichier)
     if not any(len("".join(v).strip()) >= 40 for v in variantes):
         t = ocr_texte(fichier)
         variantes = [[t]] if t else []
@@ -1621,8 +1720,8 @@ def msg_cadeau():
     return (f"Cadeau : TVA déductible seulement si la valeur est ≤ {SEUIL_CADEAU} € TTC par bénéficiaire et par an "
             "(seuil à vérifier pour l'année) ; au-delà, TVA non déductible. Relevé n° 2067 si le total des cadeaux dépasse 3 000 €.")
 
-INFOS = ("TVA non déductible appliquée", "Ventilation TVA lue sur la pièce", "Contrôle des montants impossible",
-         "Tiers reconnu grâce à une correction mémorisée")      # messages informatifs : non surlignés
+INFOS = ("Immobilisation :", "TVA non déductible appliquée", "Ventilation TVA lue sur la pièce", "Contrôle des montants impossible",
+         "Tiers reconnu grâce à une correction mémorisée", "Reste à payer")      # messages informatifs : non surlignés
 
 NOTES = ("Pièce antérieure à l'exercice", "Pièce de l'exercice suivant")   # remarques : surlignage vert pâle
 
@@ -1728,6 +1827,7 @@ FORMES_DEBUT = {"sarl", "sas", "sasu", "eurl", "sa", "sci", "snc", "scop", "sela
 
 def code_tiers(nom, type_):
     """Compte de tiers sur 7 caractères : C + 6 caractères du nom (clients) ou F + 6 (fournisseurs)."""
+    nom = re.sub(r"\b((?:[A-Za-z]\.){2,})", lambda m_: m_.group(1).replace(".", ""), str(nom))   # S.A.S. -> SAS
     jetons = norm(nom).split()
     if re.match(CIVILITE, str(nom)):                                         # particulier : nom de famille (mot en majuscules)
         maj = [norm(w) for w in re.findall(r"\b[A-ZÀ-Ý][A-ZÀ-Ý'\-]{2,}\b", str(nom)) if norm(w) not in FORMES_DEBUT]
@@ -1748,8 +1848,23 @@ def code_tiers_unique(nom, type_, codes, anomalies, ref):
     codes[cand] = cle
     return cand
 
+# ---------- Immobilisations ----------
+SEUIL_IMMO = Decimal("500")          # tolérance fiscale : biens < 500 € HT unitaire passables en charge (BOI-BIC-CHG-20-30-10)
+IMMOS = OrderedDict([
+    ("218300", "Matériel de bureau et informatique"), ("218400", "Mobilier"), ("215400", "Matériel industriel"),
+    ("215500", "Outillage industriel"), ("218100", "Installations générales, agencements"),
+    ("218200", "Matériel de transport (utilitaire)"), ("218210", "Véhicule de tourisme VP (TVA non récupérable)"),
+    ("205100", "Logiciels, licences"), ("213500", "Agencements des constructions"), ("213100", "Bâtiments"),
+    ("211000", "Terrains"), ("218800", "Autres immobilisations corporelles")])
+COMPTE_TVA_IMMO = "4456210"          # TVA déductible sur immobilisations (PCG 44562)
+COMPTES_PETIT_EQUIP = ("605", "6063", "6064", "6068")
+MOTS_IMMO = (r"ordinateur|\bpc\b|portable|macbook|imac|serveur|imprimante|copieur|photocopieur|[ée]cran|moniteur|tablette|ipad|"
+             r"smartphone|iphone|t[ée]l[ée]phone|mobilier|bureau\b|armoire|fauteuil|si[èe]ge|machine|outillage|perceuse|"
+             r"compresseur|pont\s*[ée]l[ée]vateur|v[ée]hicule|camion|remorque|chariot|logiciel|licence|climatisation|"
+             r"agencement|am[ée]nagement|installation|[ée]quipement|mat[ée]riel")
+
 def construire_ecritures(lignes, type_, anomalies, regles=None, comptes=None, tva_comptes=None, produits_tva=None,
-                         tva_nd=None, tiers_au_compte=True):
+                         tva_nd=None, tiers_au_compte=True, immobilisations=None, compte_tva_immo=COMPTE_TVA_IMMO):
     cfg = (comptes or COMPTES)[type_]
     tvac = tva_comptes or TVA_COMPTES
     regles, signales, codes, tronques, nd_regles = regles or [], set(), {}, set(), tva_nd or []
@@ -1809,8 +1924,11 @@ def construire_ecritures(lignes, type_, anomalies, regles=None, comptes=None, tv
         else:                                                    # collectif + compte auxiliaire
             ecr(cfg["tiers"], "Clients" if type_ == "vente" else "Fournisseurs", code, tiers, ttc_calc, st)
         charges, deduc = OrderedDict(), OrderedDict()           # une ligne par compte de charge/produit, une par taux de TVA
+        cle_f = f"{ls[0]['n'].rsplit(':', 1)[0]}|{numero}"
+        immo_f = (immobilisations or {}).get(cle_f) if type_ == "achat" else None
         for x in ls:
             cpt, libc = x["compte"], cfg["libelle_cp"]
+            if immo_f: cpt, libc = immo_f, IMMOS.get(immo_f, "Immobilisation")
             if not cpt:
                 reg = trouver_regle(tiers, regles, type_)
                 if reg: cpt, libc = reg[0], (reg[1] or libc)
@@ -1824,8 +1942,20 @@ def construire_ecritures(lignes, type_, anomalies, regles=None, comptes=None, tv
             if type_ == "achat" and (cpt.startswith("6234") or re.search(r"cadeau|coffret|\bgift\b|bon d achat", norm(tiers + " " + x.get("libelle", "")))) \
                and not any(a[1] == msg_cadeau() and a[2] == numero for a in anomalies):
                 anomalies.append((x["n"], msg_cadeau(), numero))
+            immo = type_ == "achat" and cpt.startswith("2")       # immobilisation (cochée ou imputée en classe 2)
+            if immo and not immo_f and libc == cfg["libelle_cp"]: libc = IMMOS.get(cpt, "Immobilisation")
+            if type_ == "achat" and not immo and x["ht"] >= SEUIL_IMMO and \
+               (cpt.startswith(COMPTES_PETIT_EQUIP) or re.search(MOTS_IMMO, norm(x.get("libelle", "")))) and \
+               not any(a[1].startswith("Immobilisation ?") and a[2] == numero for a in anomalies):
+                anomalies.append((x["n"], f"Immobilisation ? {x['ht']} € HT en charge (compte {cpt}) : au-delà de 500 € HT "
+                                          "par bien, cochez « Immo »", numero))
             nd = Decimal("0")
-            if type_ == "achat" and nd_regles:                   # TVA non déductible : incorporée à la charge
+            if immo and cpt.startswith("21821"):                  # véhicule de tourisme : TVA non récupérable, dans le coût
+                nd = x["tva"]
+                if (tiers, "ndvp") not in signales:
+                    signales.add((tiers, "ndvp"))
+                    anomalies.append((x["n"], "TVA non déductible appliquée : 100 % (véhicule de tourisme immobilisé)", tiers))
+            elif type_ == "achat" and nd_regles:                 # TVA non déductible : incorporée à la charge
                 rg = trouver_nd(cpt, nd_regles)
                 if rg:
                     nd = (x["tva"] * rg[0] / 100).quantize(Decimal("0.01"), ROUND_HALF_UP)
@@ -1833,11 +1963,14 @@ def construire_ecritures(lignes, type_, anomalies, regles=None, comptes=None, tv
                         signales.add((tiers, "nd"))
                         anomalies.append((x["n"], f"TVA non déductible appliquée : {rg[0]} % ({rg[1] or 'règle'})", tiers))
             charges[(cpt, libc)] = charges.get((cpt, libc), Decimal("0")) + x["ht"] + nd
-            deduc[x["taux"]] = deduc.get(x["taux"], Decimal("0")) + x["tva"] - nd
+            deduc[(x["taux"], immo)] = deduc.get((x["taux"], immo), Decimal("0")) + x["tva"] - nd
+        if immo_f:
+            anomalies.append((ls[0]["n"], f"Immobilisation : {immo_f} {IMMOS.get(immo_f, '')}", numero))
         for (cpt, libc), v in charges.items():
             ecr(cpt, libc, "", "", v, sc)
-        for t, v in deduc.items():
-            ecr(tvac.get(t, TVA_INCONNUE)[idx], TVA_LIB, "", "", v, sc)
+        for (t, immo), v in deduc.items():
+            if immo: ecr(compte_tva_immo or COMPTE_TVA_IMMO, "TVA déductible sur immobilisations", "", "", v, sc)
+            else: ecr(tvac.get(t, TVA_INCONNUE)[idx], TVA_LIB, "", "", v, sc)
     return ecritures
 
 # ---------- Export FEC ----------
@@ -2067,6 +2200,11 @@ def rapprocher(lignes, pieces, manuels=None, ventiler=True):
         k = cle_de(l)
         if res.get(k, ("",))[0]:
             l["pj"], l["pj_page"] = res[k][0], pages.get(k, "")
+            if ma_societe() and not any(str(x).startswith("ms:") for x in l.get("ids", [])):
+                info = par_nom[res[k][0]]; pg = pages.get(k, "")
+                txt = info["pages"][int(pg) - 1] if pg and info["pages"] else "\n".join(info["pages"])
+                if len(txt.strip()) >= 40:
+                    l["ids"] = list(l.get("ids", [])) + [f"ms:{int(societe_presente(txt))}"]
     return [{"cle": k, "numero": f["numero"], "tiers": f["tiers"], "ttc": str(f["ttc"]),
              "piece": res.get(k, ("",))[0], "page": pages.get(k, ""), "ventilation": ventile.get(k, ""),
              "controle": {"ok": "✅ identiques", "ecart": "⚠️ " + controles.get(k, ("", ""))[1].split(" : ", 1)[-1],
@@ -2169,11 +2307,13 @@ def traiter(*args, **kwargs):
         return _traiter(*args, **kwargs)
     finally:
         purger_caches()
+        _CTX.societe, _CTX.siren = "", ""
 
 def _traiter(fichiers, type_="vente", siren="000000000", exercice="", sortie=".", regles=None,
             mappings=None, comptes=None, tva_comptes=None, separateur="tab", tiers_corriges=None, pieces=None, rapprochements=None, produits_tva=None, tva_nd=None, tiers_au_compte=True, ventilations=None,
             vehicule="VP", carburant="Gazole", comptes_carburant=COMPTE_CARBURANT_DEFAUT, ventiler_pieces=True,
-            debut_exercice=None, appris=None):
+            debut_exercice=None, appris=None, immobilisations=None, compte_tva_immo=COMPTE_TVA_IMMO, societe=""):
+    _CTX.societe, _CTX.siren = societe or "", re.sub(r"\D", "", str(siren or ""))[:9]
     anomalies, lignes = [], []
     for f in fichiers:
         nom = os.path.basename(f)
@@ -2220,6 +2360,15 @@ def _traiter(fichiers, type_="vente", siren="000000000", exercice="", sortie="."
                 multi.append({"cle": f"{a[0]}|{a[2]}", "numero": a[2], "tiers": inv[0]["tiers"],
                               "ht": str(sum(l["ht"] for l in inv)), "tva": str(sum(l["tva"] for l in inv))})
     rapp = rapprocher(lignes, pieces, rapprochements, ventiler_pieces) if pieces else []
+    if ma_societe():                                          # votre entreprise figure-t-elle sur chaque document ?
+        groupes_ms = OrderedDict()
+        for l in lignes: groupes_ms.setdefault(f"{l['n'].rsplit(':', 1)[0]}|{l['numero']}", []).append(l)
+        for cle, ls in groupes_ms.items():
+            fl = {x for l in ls for x in l.get("ids", []) if str(x).startswith("ms:")}
+            if fl and "ms:1" not in fl:
+                msg = ("n'apparaît pas sur la facture fournisseur : vérifiez qu'elle vous est bien adressée" if type_ == "achat"
+                       else "n'apparaît pas sur la facture de vente : vérifiez qu'elle appartient au dossier")
+                anomalies.append((ls[0]["n"], f"Votre entreprise ({ma_societe()[0]}) {msg}", ls[0]["numero"]))
     for rr in rapp:
         if rr.get("ventilation"):
             anomalies.append((rr["cle"].split("|")[0], f"Ventilation TVA lue sur la pièce : {rr['ventilation']}", rr["numero"]))
@@ -2238,12 +2387,23 @@ def _traiter(fichiers, type_="vente", siren="000000000", exercice="", sortie="."
     factures = list(OrderedDict(((f"{l['n'].rsplit(':', 1)[0]}|{l['numero']}"),
                                  {"cle": f"{l['n'].rsplit(':', 1)[0]}|{l['numero']}", "fichier": l["n"].rsplit(":", 1)[0],
                                   "numero": l["numero"], "tiers": l["tiers"], "tiers_lu": l.get("tiers_lu", l["tiers"]),
-                                  "ids": l.get("ids", [])}) for l in lignes).values())
+                                  "ids": l.get("ids", []),
+                                  "ht": str(sum(x["ht"] for x in lignes if x["n"].rsplit(":", 1)[0] == l["n"].rsplit(":", 1)[0]
+                                                and x["numero"] == l["numero"]))}) for l in lignes).values())
     ecr = construire_ecritures(lignes, type_, anomalies,
                                preparer_regles(regles if regles is not None else charger_imputations()),
                                comptes, tva_comptes, produits_tva,
                                preparer_nd(tva_nd if tva_nd is not None else tva_nd_defaut_df(), vehicule, carburant, comptes_carburant),
-                               tiers_au_compte)
+                               tiers_au_compte, immobilisations, compte_tva_immo)
+    par_n = OrderedDict()
+    for e in ecr: par_n.setdefault(e["num"], []).append(e)
+    for n_, ls_ in par_n.items():                             # écart débit / crédit : compte d'attente 471000 + erreur
+        ecart = sum(e["debit"] for e in ls_) - sum(e["credit"] for e in ls_)
+        if ecart:
+            x = dict(ls_[-1]); x.update(compte="471000", libc="Compte d'attente", aux="", auxl="",
+                                        debit=-ecart if ecart < 0 else Decimal("0"), credit=ecart if ecart > 0 else Decimal("0"))
+            ecr.insert(ecr.index(ls_[-1]) + 1, x)
+            anomalies.append((ls_[0]["ref"], f"Erreur : écriture déséquilibrée de {abs(ecart)} € (écart mis en 471000) : vérifiez HT / TVA / TTC", ls_[0]["piece"]))
     controles_finaux(ecr, type_, exercice, anomalies, debut_exercice)
     tagger_alertes(ecr, anomalies)
     fec, total = ecrire_fec(ecr, type_, siren, exercice, sortie, comptes, separateur)
