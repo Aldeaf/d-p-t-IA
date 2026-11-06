@@ -12,7 +12,7 @@ PDF/images : Factur-X (XML intégré) -> texte du PDF (règles) -> OCR PaddleOCR
 -> IA Claude (facultatif, payant, si ANTHROPIC_API_KEY est défini).
 """
 import argparse, hashlib, io, json, os, re, shutil, sys, tempfile, unicodedata, zipfile
-VERSION = "2026.11.05-h"
+VERSION = "2026.11.05-j"
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from decimal import Decimal, ROUND_HALF_UP
@@ -131,19 +131,19 @@ def sauver_mapping(df, m, dossier="mappings"):
     os.makedirs(dossier, exist_ok=True)
     json.dump(m, open(os.path.join(dossier, f"{empreinte(df)}.json"), "w", encoding="utf-8"), indent=2, ensure_ascii=False)
 
-def exporter_reglages(comptes, tva_comptes, produits_tva=None, dossier="mappings"):
+def exporter_reglages(comptes, tva_comptes, produits_tva=None, tva_nd=None, dossier="mappings"):
     """Tout ce qui se règle dans l'app, dans un dictionnaire sauvegardable (JSON)."""
     maps = {}
     if os.path.isdir(dossier):
         for f in os.listdir(dossier):
             if f.endswith(".json"): maps[f[:-5]] = json.load(open(os.path.join(dossier, f), encoding="utf-8"))
-    return {"comptes": comptes, "tva_comptes": tva_comptes, "produits_tva": produits_tva, "mappings": maps}
+    return {"comptes": comptes, "tva_comptes": tva_comptes, "produits_tva": produits_tva, "tva_nd": tva_nd, "mappings": maps}
 
 def importer_reglages(d, dossier="mappings"):
     os.makedirs(dossier, exist_ok=True)
     for emp, m in (d.get("mappings") or {}).items():
         json.dump(m, open(os.path.join(dossier, f"{emp}.json"), "w", encoding="utf-8"), indent=2, ensure_ascii=False)
-    return d.get("comptes"), d.get("tva_comptes"), d.get("produits_tva")
+    return d.get("comptes"), d.get("tva_comptes"), d.get("produits_tva"), d.get("tva_nd")
 
 def charger_mapping(df, dossier="mappings"):
     chemin = os.path.join(dossier, f"{empreinte(df)}.json")
@@ -427,7 +427,7 @@ def _taux_lignes(lignes):
     """Lignes à un seul taux (ex. '20 %  145,83  29,17') -> (taux, base, tva), selon que la ligne
     contient base+TVA (A) ou base+TTC (B). Les montants sont reconnus par le calcul, pas par leur place."""
     A, B = [], []
-    for l in lignes:
+    for li, l in enumerate(lignes):
         p = list(re.finditer(r"(\d{1,2}(?:[.,]\d{1,2})?)\s*%", l))
         if len(p) != 1: continue
         r = Decimal(p[0].group(1).replace(",", "."))
@@ -439,6 +439,11 @@ def _taux_lignes(lignes):
               if i != j and t > b and r > 0 and abs(b * (1 + r / 100) - t) <= Decimal("0.02")]
         if pa: b, v = max(pa); A.append((float(r), b, v))
         elif pb: b, v = max(pb); B.append((float(r), b, v))
+        elif len(nums) == 1 and li + 1 < len(lignes):          # base sur la ligne du taux, TVA sur la ligne suivante
+            suiv = [montant(x) for x in re.findall(NB, lignes[li + 1])]
+            suiv = [abs(x) for x in suiv if x is not None]
+            if len(suiv) == 1 and nums[0] > suiv[0] and abs(nums[0] * r / 100 - suiv[0]) <= Decimal("0.02"):
+                A.append((float(r), nums[0], suiv[0]))
     return A, B
 
 def _ventiler(candidats, ht, tva_tot):
@@ -503,15 +508,37 @@ PATS_NUM = [
     (True, r"\bn[°º]\s*:?\s*"),
 ]
 
+PLAQUE = re.compile(r"^[A-Z]{2}[-\s]?\d{3}[-\s]?[A-Z]{2}$|^\d{1,4}[-\s]?[A-Z]{2,3}[-\s]?\d{2,3}$", re.I)
+CTX_NON_FACTURE = (r"immat\w*|plaque|v[ée]hicule|chassis|châssis|\bvin\b|\bkm\b|kilom\w*|s[ée]rie|t[ée]l\w*|mobile|portable|"
+                   r"fax|siren|siret|\btva\b|iban|\bbic\b|\brcs\b|\bnaf\b|\bape\b|client|compte|commande|contrat|dossier|"
+                   r"devis|bon\s*de|livraison|colis|suivi|imei")
+LIGNE_VEHICULE = r"immat\w*|plaque|v[ée]hicule|marque|mod[èe]le|kilom\w*|\bkm\b|chassis|châssis"
+
+def _plaques(t):
+    """Immatriculations citées dans le texte (à ne jamais prendre pour un numéro de facture)."""
+    out = set()
+    for pat in (r"(?:immat\w*|plaque\w*)\W{0,25}([A-Z0-9][A-Z0-9\-]{4,10})", r"(?:immat\w*|plaque\w*)\W{0,25}([A-Z]{2}[\s-]?\d{3}[\s-]?[A-Z]{2})"):
+        for r in re.finditer(pat, t, re.I):
+            out.add(re.sub(r"[^A-Z0-9]", "", r.group(1).upper()))
+    return out
+
 def _numero(texte):
     t = _norm_txt(texte)
+    plaques = _plaques(t)
     for explicite, pat in PATS_NUM:
         for r in re.finditer(pat + TOKEN, t, re.I):
             c = r.group(1).strip(".-/_,")
             if not c or re.fullmatch(D_NUM, c) or re.fullmatch(r"(?:19|20)\d{2}", c) or re.fullmatch(r"\d{9}|\d{14}", c): continue
             if len(c) < (1 if explicite else 4): continue
-            if re.search(r"siren|siret|tva|iban|bic|t[ée]l|rcs|naf|ape|client|compte", t[max(0, r.start(1) - 18):r.start(1)], re.I) \
-               and not re.search(r"facture|invoice|avoir", t[max(0, r.start(1) - 18):r.start(1)], re.I): continue
+            if PLAQUE.match(c) or re.sub(r"[^A-Z0-9]", "", c.upper()) in plaques: continue          # immatriculation
+            if c.isdigit() and len(c) <= 4 and re.match(r"[\s-]*[A-Z]{2,3}[\s-]*\d{2,3}\b", t[r.end(1):r.end(1) + 8]): continue   # 1234 AB 56
+            ls_, le_ = t.rfind("\n", 0, r.start(1)) + 1, t.find("\n", r.end(1))
+            ligne = t[ls_:(le_ if le_ >= 0 else len(t))]
+            ctx = t[ls_:r.start(1)]                                  # libellé sur la même ligne...
+            if not ctx.strip():                                      # ...ou sur la ligne précédente (valeur seule)
+                ctx = t[t.rfind("\n", 0, max(ls_ - 1, 0)) + 1:ls_]
+            if re.search(r"factur|invoice|avoir", ctx + " " + ligne, re.I): pass
+            elif re.search(CTX_NON_FACTURE, ctx, re.I) or re.search(LIGNE_VEHICULE, ligne, re.I): continue
             return c
     return ""
 
@@ -625,6 +652,8 @@ def lire_texte(texte, type_, nom):
     avoir = re.search(r"^\s*(?:facture\s*d')?avoir\b(?!\s*lieu)|credit\s*note|note\s*de\s*cr[ée]dit|facture\s*d'avoir",
                       "\n".join(lignes[:25]), re.I | re.M)
     sg = -1 if (avoir and ht > 0) else 1
+    if type_ == "achat" and re.search(r"cadeaux?\b|coffrets?\s*cadeau|carte\s*cadeau|bon\s*cadeau", t, re.I):
+        anom.append((msg_cadeau(), numero))
     if re.search(r"autoliquidation|reverse\s*charge", t, re.I):
         anom.append(("Autoliquidation de TVA : écritures de TVA à traiter manuellement", numero))
     if re.search(r"\b(?:USD|GBP|CHF)\b|[$£]", t) and not re.search(r"€|\bEUR\b|euros?", t, re.I):
@@ -738,16 +767,51 @@ def taux_str(t):
     return str(t).rstrip("0").rstrip(".") if "." in str(t) else str(t)
 
 # ---------- Format pivot ----------
+def colonnes_par_taux(df):
+    """Colonnes du type 'HT 20%', 'Base HT 5,5', 'TVA 10 %' -> {taux: {'ht': col, 'tva': col}} (au moins un taux avec HT)."""
+    res = {}
+    for c in df.columns:
+        h = str(c).lower()
+        r = re.search(r"(?<![\d.,])(\d{1,2}(?:[.,]\d{1,2})?)\s*%", h) or \
+            re.search(r"(?:ht|base|tva|taxe|vat)\D{0,10}?(?<![\d.,])(\d{1,2}(?:[.,]\d{1,2})?)(?![\d.,])", h)
+        if not r or re.search(r"\bttc\b", h): continue
+        t = Decimal(r.group(1).replace(",", "."))
+        nh = norm(h)
+        est_tva, est_ht = re.search(r"\b(tva|taxe|vat)\b", nh), re.search(r"\b(ht|hors|base|net)\b", nh)
+        kind = "tva" if est_tva and not est_ht else "ht" if est_ht and not est_tva else None
+        if kind and t <= 30: res.setdefault(taux_str(t), {})[kind] = c
+    return {t: v for t, v in res.items() if "ht" in v}
+
 def vers_pivot(df, m, anomalies, src=""):
     for c in OBLIGATOIRES:
         if c not in m:
             raise ValueError(f"Colonne obligatoire non détectée : '{c}'. Complétez le fichier mappings/*.json")
-    lignes = []
+    lignes, wide = [], colonnes_par_taux(df)
+    if len(wide) < 2: wide = {}
     for i, r in df.iterrows():
         n = f"{src}:{i + 2}"
         d = date(r[m["date"]])
         if d is None:
             anomalies.append((n, "Date illisible", r[m["date"]])); continue
+        g = lambda k: (str(r[m[k]]).strip() if k in m and pd.notna(r[m[k]]) else "")
+        page = str(int(float(r["Page"]))) if "Page" in df.columns and pd.notna(r["Page"]) else ""
+        if wide:                                              # une colonne HT / TVA par taux : une ligne par taux
+            parts = []
+            for t, cols in wide.items():
+                h = montant(r[cols["ht"]]) if "ht" in cols else None
+                v = montant(r[cols["tva"]]) if "tva" in cols else None
+                if not h and not v: continue
+                h = h or Decimal("0")
+                parts.append((t, h, v if v is not None else (h * Decimal(t) / 100).quantize(Decimal("0.01"), ROUND_HALF_UP)))
+            if parts:
+                ttc_row = montant(r[m["ttc"]]) if "ttc" in m else None
+                tot = sum(h + v for _, h, v in parts)
+                if ttc_row is not None and abs(tot - ttc_row) > Decimal("0.02"):
+                    anomalies.append((n, f"Colonnes par taux : HT+TVA ({tot}) <> TTC ({ttc_row})", g("numero")))
+                for t, h, v in parts:
+                    lignes.append(dict(n=n, date=d, numero=g("numero"), tiers=g("tiers"), code=g("code_tiers"),
+                                       libelle=g("libelle"), compte=g("compte"), page=page, ht=h, tva=v, ttc=h + v, taux=t))
+                continue
         ht = montant(r[m["ht"]]) if "ht" in m else None
         tva = montant(r[m["tva"]]) if "tva" in m else None
         ttc = montant(r[m["ttc"]]) if "ttc" in m else None
@@ -762,8 +826,6 @@ def vers_pivot(df, m, anomalies, src=""):
                   else (ttc - ht if ttc is not None else Decimal("0"))
         if taux is None:
             taux = (tva / ht * 100).quantize(Decimal("0.1")) if ht else Decimal("0")
-        g = lambda k: (str(r[m[k]]).strip() if k in m and pd.notna(r[m[k]]) else "")
-        page = str(int(float(r["Page"]))) if "Page" in df.columns and pd.notna(r["Page"]) else ""
         lignes.append(dict(n=n, date=d, numero=g("numero"), tiers=g("tiers"), code=g("code_tiers"),
                            libelle=g("libelle"), compte=g("compte"), page=page, ht=ht, tva=tva, ttc=ttc,
                            taux=taux_str(taux)))
@@ -857,6 +919,62 @@ def trouver_regle(tiers, regles, type_=None):
                 return compte, lib
     return None
 
+# ---------- TVA non déductible (achats) ----------
+# Règles de DÉPART, INDICATIVES, à valider selon le dossier (nature de la dépense, véhicule, activité) et à paramétrer :
+# motif (mot du nom du tiers) et/ou préfixe de compte de charge -> % de TVA non déductible (incorporé à la charge).
+_ND = {
+    (100, "Hébergement : TVA non déductible"): ["hotel", "ibis", "novotel", "mercure", "campanile", "kyriad", "airbnb"],
+    (100, "Transport de personnes : TVA non déductible"): [
+        "sncf", "ouigo", "uber", "bolt", "g7", "taxi", "taxis", "ratp", "navigo", "flixbus", "blablacar", "eurostar",
+        "air france", "easyjet", "ryanair", "transavia"],
+    (20, "Carburant : 80 % déductible en général, selon véhicule et carburant (à valider)"): ["esso", "shell", "bp", "avia", "q8", "dkv"],
+}
+TVA_ND_DEFAUT = [(m, "", p, com) for (p, com), ms in _ND.items() for m in ms]
+COLS_ND = ["motif", "compte", "pct_non_deductible", "commentaire"]
+
+def tva_nd_defaut_df():
+    return pd.DataFrame(TVA_ND_DEFAUT, columns=COLS_ND)
+
+def preparer_nd(df):
+    out = []
+    for _, r in df.iterrows():
+        p = montant(_s(r.get("pct_non_deductible")))
+        motif, cpt = norm(_s(r.get("motif"))), re.sub(r"\W", "", _s(r.get("compte")))
+        if p is not None and 0 < p <= 100 and (motif or cpt):
+            out.append((motif, cpt, p, _s(r.get("commentaire"))))
+    return out
+
+def trouver_nd(tiers, compte, regles):
+    """Règle la plus précise : (motif + compte) > motif > compte. Renvoie (pourcentage, commentaire) ou None."""
+    n, best = norm(tiers), None
+    for motif, cpt, p, com in regles:
+        if motif and not re.search(rf"(?<![a-z0-9]){re.escape(motif)}(?![a-z0-9])", n): continue
+        if cpt and not compte.startswith(cpt): continue
+        spec = (bool(motif) + bool(cpt), len(motif) + len(cpt))
+        if best is None or spec > best[0]: best = (spec, p, com)
+    return (best[1], best[2]) if best else None
+
+SEUIL_CADEAU = 73   # € TTC par bénéficiaire et par an (art. 23 N, annexe IV du CGI) : à revérifier chaque année
+
+def msg_cadeau():
+    return (f"Cadeau : TVA déductible seulement si la valeur est ≤ {SEUIL_CADEAU} € TTC par bénéficiaire et par an "
+            "(seuil à vérifier pour l'année) ; au-delà, TVA non déductible. Relevé n° 2067 si le total des cadeaux dépasse 3 000 €.")
+
+INFOS = ("TVA non déductible appliquée",)      # messages informatifs : non surlignés
+
+def tagger_alertes(ecritures, anomalies):
+    """Ajoute à chaque écriture le texte des alertes/erreurs qui la concernent (colonne 'alerte')."""
+    msgs = {}
+    for ref, msg, detail in anomalies:
+        if msg.startswith(INFOS): continue
+        f = str(ref).split(":")[0]
+        for e in ecritures:
+            if (detail == e["piece"] and f == e["fichier"]) or (detail and detail == e["tiers"]) or ref == e["ref"]:
+                lst = msgs.setdefault(e["num"], [])
+                if msg not in lst: lst.append(msg)
+    for e in ecritures:
+        e["alerte"] = " | ".join(msgs.get(e["num"], []))
+
 # ---------- Contrôles + écritures ----------
 FORMES_DEBUT = {"sarl", "sas", "sasu", "eurl", "sa", "sci", "snc", "scop", "selarl", "earl", "gaec", "ets", "etablissements",
                 "ste", "societe", "mr", "mme", "monsieur", "madame", "m", "le", "la", "les", "l"}
@@ -880,10 +998,11 @@ def code_tiers_unique(nom, type_, codes, anomalies, ref):
     codes[cand] = cle
     return cand
 
-def construire_ecritures(lignes, type_, anomalies, regles=None, comptes=None, tva_comptes=None, produits_tva=None):
+def construire_ecritures(lignes, type_, anomalies, regles=None, comptes=None, tva_comptes=None, produits_tva=None,
+                         tva_nd=None, tiers_au_compte=True):
     cfg = (comptes or COMPTES)[type_]
     tvac = tva_comptes or TVA_COMPTES
-    regles, signales, codes, tronques = regles or [], set(), {}, set()
+    regles, signales, codes, tronques, nd_regles = regles or [], set(), {}, set(), tva_nd or []
     prod = produits_tva or PRODUITS_TVA
     pref = next(iter(prod.values()))[0][:3] if prod else "706"
     factures = OrderedDict()
@@ -913,7 +1032,7 @@ def construire_ecritures(lignes, type_, anomalies, regles=None, comptes=None, tv
         avoir = ttc_calc < 0
         num += 1
         lib = f"{numero} {tiers}".strip()[:100]
-        aux = code_tiers_unique(tiers, type_, codes, anomalies, ls[0]["n"])
+        code = code_tiers_unique(tiers, type_, codes, anomalies, ls[0]["n"])
         def ecr(compte, libc, aux_n, aux_l, montant_, sens):
             if montant_ == 0: return
             if len(compte) > 7:                                  # comptes limités à 7 caractères
@@ -921,11 +1040,15 @@ def construire_ecritures(lignes, type_, anomalies, regles=None, comptes=None, tv
                     tronques.add(compte); anomalies.append((ls[0]["n"], f"Compte {compte} tronqué à 7 caractères : {compte[:7]}", numero))
                 compte = compte[:7]
             sens = sens if not avoir else ("C" if sens == "D" else "D")
-            ecritures.append(dict(num=num, src=src, page=page, date=d, compte=compte, libc=libc, aux=aux_n, auxl=aux_l,
+            ecritures.append(dict(num=num, src=src, page=page, tiers=tiers, fichier=ls[0]["n"].rsplit(":", 1)[0], ref=ls[0]["n"], date=d, compte=compte, libc=libc, aux=aux_n, auxl=aux_l,
                                   piece=numero, lib=lib, debit=abs(montant_) if sens == "D" else Decimal("0"),
                                   credit=abs(montant_) if sens == "C" else Decimal("0")))
         st = cfg["sens_tiers"]; sc = "C" if st == "D" else "D"
-        ecr(cfg["tiers"], "Clients" if type_ == "vente" else "Fournisseurs", aux, tiers, ttc_calc, st)
+        if tiers_au_compte:                                      # compte de tiers directement au niveau du compte
+            ecr(code, tiers, "", "", ttc_calc, st)
+        else:                                                    # collectif + compte auxiliaire
+            ecr(cfg["tiers"], "Clients" if type_ == "vente" else "Fournisseurs", code, tiers, ttc_calc, st)
+        charges, deduc = OrderedDict(), OrderedDict()           # une ligne par compte de charge/produit, une par taux de TVA
         for x in ls:
             cpt, libc = x["compte"], cfg["libelle_cp"]
             if not cpt:
@@ -938,10 +1061,23 @@ def construire_ecritures(lignes, type_, anomalies, regles=None, comptes=None, tv
                     if type_ == "achat" and tiers not in signales:
                         signales.add(tiers)
                         anomalies.append((x["n"], f"Aucune règle d'imputation : compte par défaut {cpt}", tiers))
-            ecr(cpt, libc, "", "", x["ht"], sc)
-        for t, v in tva_par_taux.items():
-            cpt = tvac.get(t, TVA_INCONNUE)[idx]
-            ecr(cpt, TVA_LIB, "", "", v, sc)
+            if type_ == "achat" and (cpt.startswith("6234") or re.search(r"cadeau|coffret|\bgift\b|bon d achat", norm(tiers + " " + x.get("libelle", "")))) \
+               and not any(a[1] == msg_cadeau() and a[2] == numero for a in anomalies):
+                anomalies.append((x["n"], msg_cadeau(), numero))
+            nd = Decimal("0")
+            if type_ == "achat" and nd_regles:                   # TVA non déductible : incorporée à la charge
+                rg = trouver_nd(tiers, cpt, nd_regles)
+                if rg:
+                    nd = (x["tva"] * rg[0] / 100).quantize(Decimal("0.01"), ROUND_HALF_UP)
+                    if (tiers, "nd") not in signales:
+                        signales.add((tiers, "nd"))
+                        anomalies.append((x["n"], f"TVA non déductible appliquée : {rg[0]} % ({rg[1] or 'règle'})", tiers))
+            charges[(cpt, libc)] = charges.get((cpt, libc), Decimal("0")) + x["ht"] + nd
+            deduc[x["taux"]] = deduc.get(x["taux"], Decimal("0")) + x["tva"] - nd
+        for (cpt, libc), v in charges.items():
+            ecr(cpt, libc, "", "", v, sc)
+        for t, v in deduc.items():
+            ecr(tvac.get(t, TVA_INCONNUE)[idx], TVA_LIB, "", "", v, sc)
     return ecritures
 
 # ---------- Export FEC ----------
@@ -1092,11 +1228,11 @@ def creer_archive(ecritures, fec, sources, type_, comptes=None):
         else:
             shutil.copyfile(src, chemin)
         pieces.append((nom, chemin))
-        index.append([jc, num, e["piece"], e["date"].strftime("%Y%m%d"), e["aux"],
+        index.append([jc, num, e["piece"], e["date"].strftime("%Y%m%d"), e["aux"] or e["compte"],
                       e["src"] + (f" p.{e['page']}" if e.get("page") else ""), nom])
     if not pieces: return None
     idx = os.path.join(tmp, "index_pieces.csv")
-    pd.DataFrame(index, columns=["JournalCode", "EcritureNum", "PieceRef", "EcritureDate", "CompAuxNum",
+    pd.DataFrame(index, columns=["JournalCode", "EcritureNum", "PieceRef", "EcritureDate", "CompteTiers",
                                  "Fichier source", "Pièce jointe"]).to_csv(idx, index=False, sep=";")
     lisez = os.path.join(tmp, "LISEZMOI.txt")
     open(lisez, "w", encoding="utf-8").write(
@@ -1112,8 +1248,49 @@ def creer_archive(ecritures, fec, sources, type_, comptes=None):
         z.write(idx, "index_pieces.csv"); z.write(lisez, "LISEZMOI.txt")
     return zip_path
 
+def valider_ecritures(ecr):
+    """Contrôles d'une liste d'écritures : renvoie [(n° d'écriture, message, bloquant)]."""
+    pb, soldes = [], OrderedDict()
+    for e in ecr:
+        if not e["compte"]: pb.append((e["num"], "Compte vide", True))
+        elif len(e["compte"]) > 7: pb.append((e["num"], f"Compte {e['compte']} de plus de 7 caractères", False))
+        if e["debit"] < 0 or e["credit"] < 0: pb.append((e["num"], "Montant négatif", True))
+        if e["debit"] and e["credit"]: pb.append((e["num"], "Débit et crédit sur la même ligne", False))
+        soldes[e["num"]] = soldes.get(e["num"], Decimal("0")) + e["debit"] - e["credit"]
+    pb += [(n, f"Écriture déséquilibrée : écart de {v}", True) for n, v in soldes.items() if v != 0]
+    return pb
+
+def ecritures_depuis_df(df, originaux):
+    """Reconstruit les écritures à partir du tableau modifié par l'utilisateur."""
+    par_num = {}
+    for e in originaux: par_num.setdefault(e["num"], e)
+    out = []
+    for _, r in df.iterrows():
+        try: num = int(float(r["num"]))
+        except (TypeError, ValueError): continue
+        o = par_num.get(num, {})
+        deb, cre = montant(_s(r["debit"])) or Decimal("0"), montant(_s(r["credit"])) or Decimal("0")
+        if not _s(r["compte"]) and not deb and not cre: continue
+        try: d = pd.to_datetime(r["date"]).to_pydatetime()
+        except Exception: d = o.get("date") or datetime.now()
+        if pd.isna(d): d = o.get("date") or datetime.now()
+        out.append(dict(num=num, src=o.get("src", ""), page=o.get("page", ""), tiers=o.get("tiers", ""),
+                        fichier=o.get("fichier", ""), ref=o.get("ref", ""), date=d, compte=_s(r["compte"]), libc=_s(r["libc"]),
+                        aux=_s(r["aux"]), auxl=_s(r.get("auxl", "")), piece=_s(r["piece"]) or o.get("piece", ""),
+                        lib=_s(r["lib"]), debit=deb, credit=cre, alerte=_s(r.get("alerte", ""))))
+    return sorted(out, key=lambda e: e["num"])
+
+def regenerer(df, originaux, type_, siren, exercice, sortie, comptes=None, separateur="tab", sources=None):
+    """FEC (et zip des pièces) recalculés à partir des écritures modifiées à la main."""
+    ecr = ecritures_depuis_df(df, originaux)
+    bloquants = [f"écriture {n} : {m}" for n, m, b in valider_ecritures(ecr) if b]
+    if bloquants:
+        raise ValueError("Modifications refusées — " + " ; ".join(bloquants[:5]))
+    fec, total = ecrire_fec(ecr, type_, siren, exercice, sortie, comptes, separateur)
+    return dict(ecritures=ecr, fec=fec, zip=creer_archive(ecr, fec, sources or {}, type_, comptes), total=total)
+
 def traiter(fichiers, type_="vente", siren="000000000", exercice="", sortie=".", regles=None,
-            mappings=None, comptes=None, tva_comptes=None, separateur="tab", tiers_corriges=None, pieces=None, rapprochements=None, produits_tva=None):
+            mappings=None, comptes=None, tva_comptes=None, separateur="tab", tiers_corriges=None, pieces=None, rapprochements=None, produits_tva=None, tva_nd=None, tiers_au_compte=True, ventilations=None):
     anomalies, lignes = [], []
     for f in fichiers:
         nom = os.path.basename(f)
@@ -1131,6 +1308,32 @@ def traiter(fichiers, type_="vente", siren="000000000", exercice="", sortie=".",
         cle = f"{l['n'].rsplit(':', 1)[0]}|{l['numero']}"
         if (tiers_corriges or {}).get(cle):
             l["tiers"], l["code"] = tiers_corriges[cle], ""
+    cle_de = lambda l: f"{l['n'].rsplit(':', 1)[0]}|{l['numero']}"
+    for cle, rows in (ventilations or {}).items():            # ventilation de TVA saisie à la main (multi-taux)
+        inv = [l for l in lignes if cle_de(l) == cle]
+        if not inv or not rows: continue
+        modele, ancien, neuves = inv[0], sum(l["ht"] + l["tva"] for l in inv), []
+        for rw in rows:
+            h, v, t = montant(str(rw.get("ht"))), montant(str(rw.get("tva"))), montant(str(rw.get("taux")))
+            if h is None or t is None: continue
+            neuves.append(dict(modele, ht=h, tva=v if v is not None else (h * t / 100).quantize(Decimal("0.01"), ROUND_HALF_UP),
+                               taux=taux_str(t)))
+        if not neuves: continue
+        for l in neuves: l["ttc"] = l["ht"] + l["tva"]
+        nouveau = sum(l["ttc"] for l in neuves)
+        if abs(nouveau - ancien) > Decimal("0.05"):
+            anomalies.append((cle.split("|")[0], f"Ventilation TVA : total saisi {nouveau} <> total facture {ancien}", modele["numero"]))
+        pos = lignes.index(modele)
+        lignes[:] = [l for l in lignes if cle_de(l) != cle]
+        lignes[pos:pos] = neuves
+        anomalies[:] = [a for a in anomalies if not (f"{a[0]}|{a[2]}" == cle and a[1].startswith("Taux de TVA calculé"))]
+    multi = []
+    for a in anomalies:                                       # factures dont les taux n'ont pas pu être ventilés
+        if a[1].startswith("Taux de TVA calculé") and not any(m["cle"] == f"{a[0]}|{a[2]}" for m in multi):
+            inv = [l for l in lignes if cle_de(l) == f"{a[0]}|{a[2]}"]
+            if inv:
+                multi.append({"cle": f"{a[0]}|{a[2]}", "numero": a[2], "tiers": inv[0]["tiers"],
+                              "ht": str(sum(l["ht"] for l in inv)), "tva": str(sum(l["tva"] for l in inv))})
     rapp = rapprocher(lignes, pieces, rapprochements) if pieces else []
     for rr in rapp:
         if not rr["piece"]:
@@ -1140,15 +1343,18 @@ def traiter(fichiers, type_="vente", siren="000000000", exercice="", sortie=".",
                                   "numero": l["numero"], "tiers": l["tiers"]}) for l in lignes).values())
     ecr = construire_ecritures(lignes, type_, anomalies,
                                preparer_regles(regles if regles is not None else charger_imputations()),
-                               comptes, tva_comptes, produits_tva)
+                               comptes, tva_comptes, produits_tva,
+                               preparer_nd(tva_nd if tva_nd is not None else tva_nd_defaut_df()), tiers_au_compte)
+    tagger_alertes(ecr, anomalies)
     fec, total = ecrire_fec(ecr, type_, siren, exercice, sortie, comptes, separateur)
-    archive = creer_archive(ecr, fec, {os.path.basename(f): f for f in list(fichiers) + list(pieces or [])}, type_, comptes)
+    sources = {os.path.basename(f): f for f in list(fichiers) + list(pieces or [])}
+    archive = creer_archive(ecr, fec, sources, type_, comptes)
     rapport = None
     if anomalies:
         rapport = os.path.join(sortie, "rapport_anomalies.csv")
         pd.DataFrame(anomalies, columns=["ligne_source", "anomalie", "detail"]).to_csv(rapport, index=False, sep=";")
     sans = sorted({a[2] for a in anomalies if a[1].startswith("Aucune règle d'imputation")})
-    return dict(rapprochements=rapp, factures=factures, fec=fec, zip=archive, ecritures=ecr, anomalies=anomalies, rapport=rapport, total=total, sans_regle=sans)
+    return dict(sources=sources, multi_taux=multi, rapprochements=rapp, factures=factures, fec=fec, zip=archive, ecritures=ecr, anomalies=anomalies, rapport=rapport, total=total, sans_regle=sans)
 
 def main():
     p = argparse.ArgumentParser()

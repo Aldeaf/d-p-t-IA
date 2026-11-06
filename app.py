@@ -4,12 +4,12 @@ import pandas as pd
 import streamlit as st
 import agent_fec as ag
 
-st.set_page_config(page_title="Factures → FEC", page_icon="🧾")
-st.title("🧾 Factures → FEC pour ACD")
+st.set_page_config(page_title="Agent Fec", page_icon="🧾")
+st.title("🧾 Agent Fec")
 ss = st.session_state
 
 # Vérifie que agent_fec.py est bien la dernière version (sinon message clair au lieu d'une erreur masquée)
-_REQUIS = ["VERSION", "CHAMPS_LIBELLES", "importer_reglages", "exporter_reglages", "fusionner_modele", "sauver_mapping", "creer_archive", "extraire_zip", "rapprocher", "produits_par_taux", "OBLIGATOIRES", "TVA_COMPTES"]
+_REQUIS = ["VERSION", "CHAMPS_LIBELLES", "importer_reglages", "exporter_reglages", "fusionner_modele", "sauver_mapping", "creer_archive", "extraire_zip", "rapprocher", "produits_par_taux", "preparer_nd", "colonnes_par_taux", "tva_nd_defaut_df", "OBLIGATOIRES", "TVA_COMPTES"]
 _manque = [n for n in _REQUIS if not hasattr(ag, n)]
 if _manque:
     st.error("agent_fec.py n'est pas à jour sur GitHub (il manque : " + ", ".join(_manque) +
@@ -24,7 +24,7 @@ def tva_df(d):
 def produits_df(d):
     return pd.DataFrame([(k, v[0], v[1]) for k, v in d.items()], columns=["taux", "compte", "libelle"])
 
-def appliquer_reglages(c, t, p=None):
+def appliquer_reglages(c, t, p=None, nd=None):
     for ty, base in (c or {}).items():
         ss[f"cpt_{ty}_tiers"], ss[f"cpt_{ty}_cp"], ss[f"cpt_{ty}_lib"] = base["tiers"], base["charge_produit"], base["libelle_cp"]
         ss[f"cpt_{ty}_jcode"], ss[f"cpt_{ty}_jlib"] = base["journal"][0], base["journal"][1]
@@ -34,6 +34,9 @@ def appliquer_reglages(c, t, p=None):
     if p:
         ss.prod_base = produits_df(p)
         ss.pop("ed_prod", None)
+    if nd:
+        ss.nd_base = pd.DataFrame(nd, columns=ag.COLS_ND)
+        ss.pop("ed_nd", None)
 
 if "init" not in ss:
     ss.init = True
@@ -41,6 +44,7 @@ if "init" not in ss:
     ss.imput_base = ag.charger_imputations()
     ss.tva_base = tva_df(ag.TVA_COMPTES)
     ss.prod_base = produits_df(ag.PRODUITS_TVA)
+    ss.nd_base = ag.tva_nd_defaut_df()
     if os.path.exists("reglages.json"):                      # réglages sauvegardés dans GitHub
         appliquer_reglages(*ag.importer_reglages(json.load(open("reglages.json", encoding="utf-8"))))
 if "reglages_a_charger" in ss:                               # import demandé dans l'onglet Réglages
@@ -63,6 +67,15 @@ def comptes_ui():
         if taux and taux != "nan" and str(r["compte"]).strip():
             prod[taux] = (str(r["compte"]).strip(), str(r["libelle"]).strip())
     return c, tva, prod
+
+def nd_ui():
+    """Règles de TVA non déductible à appliquer (tableau vide si désactivé)."""
+    if not ss.get("nd_actif", True):
+        return pd.DataFrame(columns=ag.COLS_ND)
+    return ss.get("nd_courant", ss.nd_base)
+
+def tiers_au_compte_ui():
+    return str(ss.get("mode_tiers", "Au niveau du compte")).startswith("Au niveau")
 
 def mapping_choisi(nom):
     m = {ch: ss.get(f"map_{nom}_{ch}") for ch in ag.CHAMPS_LIBELLES}
@@ -98,7 +111,7 @@ col1, col2 = st.columns(2)
 siren = col1.text_input("SIREN du dossier", "000000000")
 exercice = col2.text_input("Exercice (AAAA)", "2026")
 with st.sidebar:
-    st.caption(f"Version {ag.VERSION}")
+    st.caption(f"Agent Fec · version {ag.VERSION}")
     cle = st.text_input("Clé API Anthropic (facultative, secours IA)", type="password")
     if cle:
         os.environ["ANTHROPIC_API_KEY"] = cle
@@ -146,6 +159,7 @@ with tab1:
                                     regles=ss.get("imput_courant", ss.imput_base), mappings=maps, comptes=c, tva_comptes=t, produits_tva=p,
                                     separateur="pipe" if ss.get("sep_fec") == "Pipe |" else "tab",
                                     tiers_corriges=ss.get("tiers_corriges"),
+                                    tva_nd=nd_ui(), tiers_au_compte=tiers_au_compte_ui(), ventilations=ss.get("ventilations"),
                                     pieces=[chemins[n] for n in pieces_noms], rapprochements=ss.get("rapp_manuels"))
             ss.err = None
         except ValueError as e:
@@ -167,6 +181,27 @@ with tab1:
         if r.get("zip"):
             st.download_button("📎 FEC + pièces jointes (zip)", open(r["zip"], "rb").read(),
                                file_name=os.path.basename(r["zip"]), mime="application/zip")
+        if r.get("multi_taux"):
+            st.warning(f"{len(r['multi_taux'])} facture(s) avec plusieurs taux de TVA non détectés : à ventiler.")
+            with st.expander("🧮 Ventiler la TVA (multi-taux)", expanded=True):
+                st.caption("Une ligne par taux : ajoutez des lignes (+) pour 2 ou 3 taux. Le total doit égaler la facture.")
+                numeros = [m["numero"] for m in r["multi_taux"]]
+                init = pd.DataFrame([{"facture": m["numero"], "taux": "", "ht": m["ht"], "tva": m["tva"]} for m in r["multi_taux"]])
+                ev = st.data_editor(init, num_rows="dynamic", hide_index=True, use_container_width=True,
+                                    column_config={"facture": st.column_config.SelectboxColumn("facture", options=numeros)},
+                                    key=f"ed_vent_{ss.get('n_vent', 0)}")
+                if st.button("Appliquer la ventilation et régénérer"):
+                    vent = dict(ss.get("ventilations") or {})
+                    par_num = {m["numero"]: m["cle"] for m in r["multi_taux"]}
+                    for num_f, grp in ev.groupby("facture"):
+                        rows = [{"taux": g["taux"], "ht": g["ht"], "tva": g["tva"]} for _, g in grp.iterrows()
+                                if str(g["taux"]).strip() not in ("", "nan", "None")]
+                        if rows and num_f in par_num:
+                            vent[par_num[num_f]] = rows
+                    ss.ventilations = vent
+                    ss.n_vent = ss.get("n_vent", 0) + 1
+                    lancer()
+                    rerun()
         if r.get("rapprochements"):
             rap = pd.DataFrame(r["rapprochements"])
             nb = int((rap["piece"] != "").sum())
@@ -294,6 +329,8 @@ with tab3:
             a3.text_input("Code journal", b["journal"][0], key=f"cpt_{t}_jcode")
             a4.text_input("Libellé du journal", b["journal"][1], key=f"cpt_{t}_jlib")
             st.text_input("Libellé du compte par défaut", b["libelle_cp"], key=f"cpt_{t}_lib")
+        st.radio("Compte de tiers", ["Au niveau du compte (C/F + 6 caractères)", "Collectif + compte auxiliaire"],
+                 key="mode_tiers")
         st.caption("Comptes limités à 7 caractères. Compte de tiers : C + 6 premiers caractères du nom (clients), "
                    "F + 6 (fournisseurs), généré automatiquement.")
         st.markdown("**Comptes de produits par taux de TVA (ventes)**")
@@ -308,6 +345,16 @@ with tab3:
         st.markdown("**Comptes de TVA par taux**")
         ss.tva_courant = st.data_editor(ss.tva_base, num_rows="dynamic", hide_index=True,
                                         use_container_width=True, key="ed_tva")
+    with st.expander("🚫 TVA non déductible (achats)"):
+        st.checkbox("Appliquer les règles de TVA non déductible", value=True, key="nd_actif")
+        st.caption("Règles de départ INDICATIVES, à valider selon le dossier (nature de la dépense, véhicule, activité). "
+                   "Motif : mot du nom du fournisseur ; compte : début du compte de charge ; % : part de TVA non déductible, "
+                   "ajoutée à la charge. Si motif et compte sont renseignés, les deux doivent correspondre.")
+        if st.button("Remettre les règles types"):
+            ss.nd_base = ag.tva_nd_defaut_df()
+            ss.pop("ed_nd", None)
+        ss.nd_courant = st.data_editor(ss.nd_base, num_rows="dynamic", hide_index=True,
+                                       use_container_width=True, key="ed_nd")
     with st.expander("📄 Format du FEC"):
         st.radio("Séparateur des colonnes", ["Tabulation", "Pipe |"], horizontal=True, key="sep_fec")
         st.caption("Les deux sont admis pour un FEC. Choisissez celui que votre import ACD accepte (certaines sources "
@@ -315,7 +362,7 @@ with tab3:
     with st.expander("💾 Sauvegarde des réglages"):
         c, t, p = comptes_ui()
         st.download_button("⬇️ Télécharger mes réglages (reglages.json)",
-                           json.dumps(ag.exporter_reglages(c, t, p), ensure_ascii=False, indent=2).encode("utf-8"),
+                           json.dumps(ag.exporter_reglages(c, t, p, ss.get("nd_courant", ss.nd_base).to_dict("records")), ensure_ascii=False, indent=2).encode("utf-8"),
                            file_name="reglages.json", mime="application/json")
         st.caption("Pour les garder : ajoutez ce fichier à la racine de GitHub, il sera rechargé au démarrage.")
         rg = st.file_uploader("Restaurer des réglages (reglages.json)", type="json", key="reg_up")
