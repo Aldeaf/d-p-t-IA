@@ -1,5 +1,5 @@
 """Interface : streamlit run app.py"""
-import json, os, tempfile
+import contextlib, glob, io, json, os, shutil, tempfile, time
 import pandas as pd
 import streamlit as st
 import agent_fec as ag
@@ -9,35 +9,87 @@ st.title("🧾 Agent Fec")
 ss = st.session_state
 
 # Vérifie que agent_fec.py est bien la dernière version (sinon message clair au lieu d'une erreur masquée)
-_REQUIS = ["VERSION", "CHAMPS_LIBELLES", "importer_reglages", "exporter_reglages", "fusionner_modele", "sauver_mapping", "creer_archive", "extraire_zip", "rapprocher", "produits_par_taux", "preparer_nd", "colonnes_par_taux", "tva_nd_defaut_df", "OBLIGATOIRES", "TVA_COMPTES", "regenerer", "migrer_modele", "VEHICULES", "CARBURANTS", "pct_deductible_carburant", "valider_ecritures", "COLS_ND"]
+_REQUIS = ["VERSION", "CHAMPS_LIBELLES", "importer_reglages", "exporter_reglages", "fusionner_modele", "sauver_mapping", "creer_archive", "extraire_zip", "rapprocher", "produits_par_taux", "preparer_nd", "colonnes_par_taux", "tva_nd_defaut_df", "OBLIGATOIRES", "TVA_COMPTES", "regenerer", "migrer_modele", "VEHICULES", "CARBURANTS", "pct_deductible_carburant", "valider_ecritures", "COLS_ND", "purger_caches"]
 _manque = [n for n in _REQUIS if not hasattr(ag, n)]
 if _manque:
     st.error("agent_fec.py n'est pas à jour sur GitHub (il manque : " + ", ".join(_manque) +
              "). Remplacez-le par la dernière version, puis faites Manage app → Reboot app.")
     st.stop()
 rerun = getattr(st, "rerun", None) or st.experimental_rerun   # compatibilité anciennes versions de Streamlit
-_cd = getattr(st, "cache_data", None)
-cache = (lambda f: _cd(show_spinner=False, max_entries=200)(f)) if _cd else (lambda f: f)
 
-@cache
-def lire_cache(chemin, mtime):
-    """Lecture d'un CSV/Excel mise en cache (évite de relire le fichier à chaque clic)."""
-    return ag.lire(chemin)
+# ---------- Confidentialité : aucun fichier conservé ----------
+# Les fichiers déposés restent uniquement dans la mémoire de VOTRE session (jamais partagée, libérée à la fermeture
+# de l'onglet ou avec le bouton « Effacer »). Ils ne sont écrits sur le disque que le temps d'un traitement, dans un
+# dossier privé supprimé aussitôt après.
+PREFIXE = "agentfec_"
 
-@cache
-def images_pdf(chemin, page, mtime):
-    """Pages d'un PDF converties en images PNG, mises en cache."""
-    import io as _io, pdfplumber
-    out = []
-    with pdfplumber.open(chemin) as pdf:
-        pages = [pdf.pages[int(page) - 1]] if page else pdf.pages[:4]
-        for pg in pages:
-            b = _io.BytesIO(); pg.to_image(resolution=110).original.save(b, format="PNG"); out.append(b.getvalue())
-    return out
+def _purger_orphelins(age=600):
+    """Supprime les dossiers de travail laissés par un traitement interrompu (plantage, coupure)."""
+    for d in glob.glob(os.path.join(tempfile.gettempdir(), PREFIXE + "*")):
+        try:
+            if time.time() - os.path.getmtime(d) > age: shutil.rmtree(d, ignore_errors=True)
+        except OSError:
+            pass
 
-def mtime(p):
-    try: return os.path.getmtime(p)
-    except OSError: return 0
+@contextlib.contextmanager
+def atelier(noms=()):
+    """Dossier de travail privé et temporaire : les fichiers n'existent sur le disque que pendant le traitement."""
+    d = tempfile.mkdtemp(prefix=PREFIXE)
+    try:
+        os.chmod(d, 0o700)
+        chemins = {}
+        for n in noms:
+            if n in ss.get("mem", {}):
+                chemins[n] = os.path.join(d, n)
+                with open(chemins[n], "wb") as fh: fh.write(ss.mem[n])
+        yield d, chemins
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+        ag.purger_caches()
+
+def figer(res):
+    """Résultat gardé en mémoire (octets) : les fichiers produits sont lus puis effacés avec le dossier de travail."""
+    res = dict(res)
+    for k in ("fec", "zip", "rapport"):
+        chemin = res.get(k)
+        res[k + "_nom"] = os.path.basename(chemin) if chemin else ""
+        res[k + "_octets"] = open(chemin, "rb").read() if chemin and os.path.exists(chemin) else None
+        res[k] = None
+    res["sources"] = {}
+    return res
+
+def cache_session(cle, calcul):
+    c = ss.setdefault("cache", {})
+    if cle not in c: c[cle] = calcul()
+    return c[cle]
+
+def lire_mem(nom):
+    """Lecture d'un CSV / Excel déposé (gardée en mémoire de session pour ne pas relire à chaque clic)."""
+    def calc():
+        with atelier([nom]) as (d, ch):
+            return ag.lire(ch[nom])
+    return cache_session(("lire", nom, len(ss.mem.get(nom, b""))), calc)
+
+def images_pdf(nom, page):
+    """Pages d'un PDF converties en images, lues directement en mémoire."""
+    def calc():
+        import pdfplumber
+        out = []
+        with pdfplumber.open(io.BytesIO(ss.mem[nom])) as pdf:
+            pages = [pdf.pages[int(page) - 1]] if page else pdf.pages[:4]
+            for pg in pages:
+                b = io.BytesIO(); pg.to_image(resolution=110).original.save(b, format="PNG"); out.append(b.getvalue())
+        return out
+    return cache_session(("img", nom, page), calc)
+
+def effacer_tout():
+    """Efface fichiers, résultats et corrections de la session (les réglages sont conservés)."""
+    for k in ("mem", "zips", "res", "err", "cache", "tiers_corriges", "ventilations", "rapp_manuels", "res_sig", "nouv_regles"):
+        ss.pop(k, None)
+    ss.up_key = ss.get("up_key", 0) + 1                      # vide aussi la zone de dépôt
+    ag.purger_caches()
+
+_purger_orphelins()
 
 # ---------- état initial (avant tout widget) ----------
 def tva_df(d):
@@ -68,7 +120,6 @@ def appliquer_reglages(c, t, p=None, nd=None, veh=None):
 
 if "init" not in ss:
     ss.init = True
-    ss.tmp = tempfile.mkdtemp()
     ss.imput_base = ag.charger_imputations()
     ss.tva_base = tva_df(ag.TVA_COMPTES)
     ss.prod_base = produits_df(ag.PRODUITS_TVA)
@@ -110,21 +161,24 @@ def mapping_choisi(nom):
     return {k: v for k, v in m.items() if v and v != "(aucune)"}
 
 def afficher_piece(e):
-    """Affiche la facture d'origine d'une écriture (PDF, image, XML ou ligne du CSV/Excel)."""
-    chemin = ss.get("index_chemins", {}).get(e["src"]) or os.path.join(ss.tmp, e["src"])
+    """Affiche la facture d'origine d'une écriture (PDF, image, XML ou ligne du CSV/Excel), depuis la mémoire."""
+    nom = e["src"]
+    b = ss.get("mem", {}).get(nom)
     page = f", page {e['page']}" if e["page"] else ""
-    st.markdown(f"**👁️ Facture {e['piece']}** · {e['src']}{page}")
-    ext = os.path.splitext(chemin)[1].lower()
+    st.markdown(f"**👁️ Facture {e['piece']}** · {nom}{page}")
+    if b is None:
+        st.info("Fichier effacé de la session : redéposez-le pour l'afficher."); return
+    ext = os.path.splitext(nom)[1].lower()
     try:
         if ext == ".pdf":
-            for img in images_pdf(chemin, e["page"], mtime(chemin)):
+            for img in images_pdf(nom, e["page"]):
                 st.image(img, use_container_width=True)
         elif ext in (".png", ".jpg", ".jpeg"):
-            st.image(chemin, use_container_width=True)
+            st.image(b, use_container_width=True)
         elif ext == ".xml":
-            st.code(open(chemin, encoding="utf-8", errors="replace").read()[:4000], language="xml")
+            st.code(b.decode("utf-8", errors="replace")[:4000], language="xml")
         else:
-            df = lire_cache(chemin, mtime(chemin))
+            df = lire_mem(nom)
             st.dataframe(df[df.astype(str).apply(lambda l: str(e["piece"]) in l.values, axis=1)], use_container_width=True)
     except Exception as ex:
         st.warning(f"Aperçu impossible : {ex}")
@@ -137,6 +191,10 @@ siren = col1.text_input("SIREN du dossier", "000000000")
 exercice = col2.text_input("Exercice (AAAA)", "2026")
 with st.sidebar:
     st.caption(f"Agent Fec · version {ag.VERSION}")
+    if st.button("🧹 Effacer mes fichiers et résultats"):
+        effacer_tout(); rerun()
+    st.caption("🔒 Aucun fichier n'est conservé : vos documents restent dans la mémoire de votre session "
+               "et sont effacés à la fermeture de l'onglet ou avec ce bouton.")
     cle = st.text_input("Clé API Anthropic (facultative, secours IA)", type="password")
     if cle:
         os.environ["ANTHROPIC_API_KEY"] = cle
@@ -146,25 +204,30 @@ tab1, tab2, tab3 = st.tabs(["📄 Traitement", "📒 Imputations", "⚙️ Régl
 with tab1:
     st.caption("CSV/Excel : règles · XML Factur-X/UBL · PDF texte : règles · Scans : OCR si installé, sinon IA (clé facultative)")
     fichiers = st.file_uploader("Déposez vos exports ou factures", accept_multiple_files=True,
-                                type=["zip", "csv", "xlsx", "xls", "pdf", "xml", "png", "jpg", "jpeg"])
-    ss.setdefault("zips", {})
-    chemins = {}
+                                type=["zip", "csv", "xlsx", "xls", "pdf", "xml", "png", "jpg", "jpeg"],
+                                key=f"up_{ss.get('up_key', 0)}")
+    zips, mem, actifs = ss.setdefault("zips", {}), {}, set()
     for f in fichiers or []:
-        p = os.path.join(ss.tmp, f.name)
-        open(p, "wb").write(f.getbuffer())
-        if f.name.lower().endswith(".zip"):                  # zip : extraction unique, mise en cache
-            cle = (f.name, f.size)
-            if cle not in ss.zips:
+        if f.name.lower().endswith(".zip"):                  # zip : extrait une fois en mémoire, puis effacé du disque
+            cle = (f.name, f.size); actifs.add(cle)
+            if cle not in zips:
                 try:
-                    ss.zips[cle] = ag.extraire_zip(p, os.path.join(ss.tmp, f"zip{len(ss.zips)}"))
+                    with atelier() as (d, _):
+                        arch = os.path.join(d, "archive.zip")
+                        with open(arch, "wb") as fh: fh.write(f.getvalue())
+                        zips[cle] = {os.path.basename(q): open(q, "rb").read() for q in ag.extraire_zip(arch, os.path.join(d, "x"))}
                 except Exception as ex:
-                    st.error(f"{f.name} : {ex}"); ss.zips[cle] = []
-            for q in ss.zips[cle]:
-                chemins[os.path.basename(q)] = q
+                    st.error(f"{f.name} : {ex}"); zips[cle] = {}
+            mem.update(zips[cle])
         else:
-            chemins[f.name] = p
-    ss.index_chemins = chemins
-    tabulaires, docs, xmls = [[os.path.basename(p) for p in L] for L in ag.classer(list(chemins.values()))]
+            mem[f.name] = f.getvalue()
+    for cle in list(zips):                                   # zip retiré de la zone de dépôt : oublié
+        if cle not in actifs: zips.pop(cle)
+    if set(mem) != set(ss.get("mem", {})):                   # fichiers retirés : leurs aperçus sont oubliés aussi
+        ss.cache = {k: v for k, v in ss.get("cache", {}).items() if k[1] in mem}
+    ss.mem = mem
+    chemins = mem
+    tabulaires, docs, xmls = ag.classer(list(mem))
     pieces_noms = []
     if tabulaires and docs:
         if st.checkbox("📎 Rapprocher automatiquement les PDF / images du fichier Excel (pièces justificatives)",
@@ -183,17 +246,17 @@ with tab1:
         c, t, p = comptes_ui()
         maps = {n: mapping_choisi(n) for n in tabulaires if mapping_choisi(n)}
         try:
-            with st.spinner("Analyse en cours…"):
-                ss.res = ag.traiter([chemins[n] for n in a_traiter], type_, siren, exercice, ss.tmp,
+            with st.spinner("Analyse en cours…"), atelier(list(ss.mem)) as (dossier, ch):
+                ss.res = figer(ag.traiter([ch[n] for n in a_traiter], type_, siren, exercice, dossier,
                                     regles=ss.get("imput_courant", ss.imput_base), mappings=maps, comptes=c, tva_comptes=t, produits_tva=p,
                                     separateur="pipe" if ss.get("sep_fec") == "Pipe |" else "tab",
                                     tiers_corriges=ss.get("tiers_corriges"),
                                     tva_nd=nd_ui(), tiers_au_compte=tiers_au_compte_ui(), ventilations=ss.get("ventilations"),
-                                    pieces=[chemins[n] for n in pieces_noms], rapprochements=ss.get("rapp_manuels"),
+                                    pieces=[ch[n] for n in pieces_noms], rapprochements=ss.get("rapp_manuels"),
                                     vehicule=ss.get("veh_type", "VP"),
                                     carburant=None if (ss.get("veh_carb", "Gazole") == AUCUN or not ss.get("nd_actif", True)) else ss.get("veh_carb", "Gazole"),
                                     comptes_carburant=ss.get("veh_cpt", ag.COMPTE_CARBURANT_DEFAUT),
-                                    ventiler_pieces=ss.get("ventiler_pieces", True))
+                                    ventiler_pieces=ss.get("ventiler_pieces", True)))
             ss.err = None
             ss.res_sig = signature
         except ValueError as e:
@@ -225,11 +288,11 @@ with tab1:
             st.warning(f"⚠️ {len(a_voir)} point(s) à vérifier (écritures surlignées en jaune). Le FEC est équilibré.")
         else:
             st.success("✅ Contrôle final OK : FEC équilibré, aucune alerte. Prêt pour l'import dans ACD.")
-        st.download_button("⬇️ Télécharger le FEC", open(r["fec"], "rb").read(),
-                           file_name=os.path.basename(r["fec"]), mime="text/plain", type="primary")
-        if r.get("zip"):
-            st.download_button("📎 FEC + pièces jointes (zip)", open(r["zip"], "rb").read(),
-                               file_name=os.path.basename(r["zip"]), mime="application/zip")
+        st.download_button("⬇️ Télécharger le FEC", r["fec_octets"],
+                           file_name=r["fec_nom"], mime="text/plain", type="primary")
+        if r.get("zip_octets"):
+            st.download_button("📎 FEC + pièces jointes (zip)", r["zip_octets"],
+                               file_name=r["zip_nom"], mime="application/zip")
         if r.get("multi_taux"):
             st.warning(f"{len(r['multi_taux'])} facture(s) avec plusieurs taux de TVA non détectés : à ventiler.")
             with st.expander("🧮 Ventiler la TVA (multi-taux)", expanded=True):
@@ -255,13 +318,17 @@ with tab1:
             rap = pd.DataFrame(r["rapprochements"])
             nb = int((rap["piece"] != "").sum())
             st.info(f"📎 {nb} facture(s) sur {len(rap)} rapprochée(s) d'une pièce justificative.")
-            with st.expander("🔗 Rapprochement factures ↔ pièces", expanded=nb < len(rap)):
+            with st.expander("🔗 Rapprochement factures ↔ pièces", expanded=nb < len(rap) or rap.get("controle", pd.Series(dtype=str)).astype(str).str.startswith("⚠️").any()):
                 if "ventilation" not in rap: rap["ventilation"] = ""
                 rap["ventilation"] = rap["ventilation"].apply(lambda v: ", ".join(map(str, v)) if isinstance(v, (list, tuple)) else (str(v) if v else ""))
-                aff = rap[["numero", "tiers", "ttc", "piece", "ventilation", "methode"]].copy()
+                if "controle" not in rap: rap["controle"] = ""
+                nb_ecart = int(rap["controle"].astype(str).str.startswith("⚠️").sum())
+                if nb_ecart:
+                    st.warning(f"⚠️ {nb_ecart} facture(s) dont le HT ou le TTC du fichier diffère de la facture PDF.")
+                aff = rap[["numero", "tiers", "ttc", "piece", "controle", "ventilation", "methode"]].copy()
                 aff["piece"] = aff["piece"].replace("", "(aucune)")
                 ed2 = st.data_editor(aff, hide_index=True, use_container_width=True,
-                                     disabled=["numero", "tiers", "ttc", "ventilation", "methode"],
+                                     disabled=["numero", "tiers", "ttc", "controle", "ventilation", "methode"],
                                      column_config={"piece": st.column_config.SelectboxColumn("pièce", options=["(aucune)"] + pieces_noms)},
                                      key=f"ed_rapp_{ss.get('n_rapp', 0)}")
                 if st.button("Appliquer le rapprochement et régénérer"):
@@ -312,8 +379,8 @@ with tab1:
         if infos_l:
             with st.expander(f"ℹ️ {len(infos_l)} information(s) (TVA non déductible, ventilation lue sur la pièce)"):
                 st.dataframe(pd.DataFrame(infos_l, columns=["Fichier:ligne", "Information", "Détail"]), use_container_width=True, hide_index=True)
-        if r.get("rapport"):
-            st.download_button("Télécharger le rapport", open(r["rapport"], "rb").read(), file_name="rapport_anomalies.csv")
+        if r.get("rapport_octets"):
+            st.download_button("Télécharger le rapport", r["rapport_octets"], file_name="rapport_anomalies.csv")
         st.subheader("Écritures")
         ecr = pd.DataFrame(r["ecritures"])
         if "alerte" not in ecr: ecr["alerte"] = ""
@@ -361,9 +428,9 @@ with tab1:
                                   disabled=["alerte"], key=f"ed_ecr_{ss.get('n_ecr', 0)}")
             if st.button("Valider mes modifications et régénérer le FEC"):
                 try:
-                    nv = ag.regenerer(ed_e, r["ecritures"], type_, siren, exercice, ss.tmp, comptes=comptes_ui()[0],
-                                      separateur="pipe" if ss.get("sep_fec") == "Pipe |" else "tab",
-                                      sources={os.path.basename(q): q for q in ss.get("index_chemins", {}).values()})
+                    with atelier(list(ss.mem)) as (dossier, ch):
+                        nv = figer(ag.regenerer(ed_e, r["ecritures"], type_, siren, exercice, dossier, comptes=comptes_ui()[0],
+                                                separateur="pipe" if ss.get("sep_fec") == "Pipe |" else "tab", sources=ch))
                     pb = [(n, m) for n, m, b in ag.valider_ecritures(nv["ecritures"]) if not b]
                     for e in nv["ecritures"]:
                         e["alerte"] = " ; ".join(m for n, m in pb if n == e["num"]) or e.get("alerte", "")
@@ -389,9 +456,10 @@ with tab2:
         st.success(f"{n} règle(s) migrée(s) (les lignes que vous avez modifiées sont conservées).")
     up = st.file_uploader("Importer ma table (CSV)", type="csv", key="imp_up")
     if up is not None and ss.get("imp_nom") != (up.name, up.size):
-        tmp_csv = os.path.join(ss.tmp, "imputations_import.csv")
-        open(tmp_csv, "wb").write(up.getbuffer())
-        ss.imput_base, ss.imp_nom = ag.charger_imputations(tmp_csv), (up.name, up.size)
+        with atelier() as (d, _):
+            tmp_csv = os.path.join(d, "imputations_import.csv")
+            with open(tmp_csv, "wb") as fh: fh.write(up.getvalue())
+            ss.imput_base, ss.imp_nom = ag.charger_imputations(tmp_csv), (up.name, up.size)
         ss.pop("ed_imput", None)
     ss.imput_courant = st.data_editor(ss.imput_base, num_rows="dynamic", use_container_width=True,
                                       hide_index=True, key="ed_imput")
@@ -407,7 +475,7 @@ with tab3:
         for nom in tabulaires:
             st.markdown(f"**{nom}**")
             try:
-                df = lire_cache(chemins[nom], mtime(chemins[nom]))
+                df = lire_mem(nom)
             except Exception as e:
                 st.error(f"Lecture impossible : {e}"); continue
             detecte = ag.charger_mapping(df, type_=type_)
