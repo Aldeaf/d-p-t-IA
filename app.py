@@ -9,7 +9,7 @@ st.title("🧾 Agent Fec")
 ss = st.session_state
 
 # Vérifie que agent_fec.py est bien la dernière version (sinon message clair au lieu d'une erreur masquée)
-_REQUIS = ["VERSION", "CHAMPS_LIBELLES", "importer_reglages", "exporter_reglages", "fusionner_modele", "sauver_mapping", "creer_archive", "extraire_zip", "rapprocher", "produits_par_taux", "preparer_nd", "colonnes_par_taux", "tva_nd_defaut_df", "OBLIGATOIRES", "TVA_COMPTES"]
+_REQUIS = ["VERSION", "CHAMPS_LIBELLES", "importer_reglages", "exporter_reglages", "fusionner_modele", "sauver_mapping", "creer_archive", "extraire_zip", "rapprocher", "produits_par_taux", "preparer_nd", "colonnes_par_taux", "tva_nd_defaut_df", "OBLIGATOIRES", "TVA_COMPTES", "regenerer", "migrer_modele", "VEHICULES", "CARBURANTS", "pct_deductible_carburant", "valider_ecritures", "COLS_ND"]
 _manque = [n for n in _REQUIS if not hasattr(ag, n)]
 if _manque:
     st.error("agent_fec.py n'est pas à jour sur GitHub (il manque : " + ", ".join(_manque) +
@@ -24,7 +24,9 @@ def tva_df(d):
 def produits_df(d):
     return pd.DataFrame([(k, v[0], v[1]) for k, v in d.items()], columns=["taux", "compte", "libelle"])
 
-def appliquer_reglages(c, t, p=None, nd=None):
+AUCUN = "(aucune règle carburant)"
+
+def appliquer_reglages(c, t, p=None, nd=None, veh=None):
     for ty, base in (c or {}).items():
         ss[f"cpt_{ty}_tiers"], ss[f"cpt_{ty}_cp"], ss[f"cpt_{ty}_lib"] = base["tiers"], base["charge_produit"], base["libelle_cp"]
         ss[f"cpt_{ty}_jcode"], ss[f"cpt_{ty}_jlib"] = base["journal"][0], base["journal"][1]
@@ -37,6 +39,10 @@ def appliquer_reglages(c, t, p=None, nd=None):
     if nd:
         ss.nd_base = pd.DataFrame(nd, columns=ag.COLS_ND)
         ss.pop("ed_nd", None)
+    if veh:
+        if veh.get("vehicule") in ag.VEHICULES: ss.veh_type = veh["vehicule"]
+        if veh.get("carburant") in ag.CARBURANTS or veh.get("carburant") == AUCUN: ss.veh_carb = veh["carburant"]
+        if veh.get("comptes"): ss.veh_cpt = veh["comptes"]
 
 if "init" not in ss:
     ss.init = True
@@ -145,6 +151,8 @@ with tab1:
         if st.checkbox("📎 Rapprocher automatiquement les PDF / images du fichier Excel (pièces justificatives)",
                        value=True, key="use_pieces"):
             pieces_noms = docs
+    if pieces_noms:
+        st.checkbox("🧮 Analyser les pièces pour proposer la TVA multi-taux (une ligne par taux)", value=True, key="ventiler_pieces")
     a_traiter = tabulaires + xmls + ([] if pieces_noms else docs)
     if tabulaires and docs:
         st.caption(f"{len(tabulaires)} fichier(s) comptable(s) · {len(docs)} PDF/image(s) · "
@@ -160,7 +168,11 @@ with tab1:
                                     separateur="pipe" if ss.get("sep_fec") == "Pipe |" else "tab",
                                     tiers_corriges=ss.get("tiers_corriges"),
                                     tva_nd=nd_ui(), tiers_au_compte=tiers_au_compte_ui(), ventilations=ss.get("ventilations"),
-                                    pieces=[chemins[n] for n in pieces_noms], rapprochements=ss.get("rapp_manuels"))
+                                    pieces=[chemins[n] for n in pieces_noms], rapprochements=ss.get("rapp_manuels"),
+                                    vehicule=ss.get("veh_type", "VP"),
+                                    carburant=None if (ss.get("veh_carb", "Gazole") == AUCUN or not ss.get("nd_actif", True)) else ss.get("veh_carb", "Gazole"),
+                                    comptes_carburant=ss.get("veh_cpt", ag.COMPTE_CARBURANT_DEFAUT),
+                                    ventiler_pieces=ss.get("ventiler_pieces", True))
             ss.err = None
         except ValueError as e:
             ss.res, ss.err = None, str(e)
@@ -207,10 +219,12 @@ with tab1:
             nb = int((rap["piece"] != "").sum())
             st.info(f"📎 {nb} facture(s) sur {len(rap)} rapprochée(s) d'une pièce justificative.")
             with st.expander("🔗 Rapprochement factures ↔ pièces", expanded=nb < len(rap)):
-                aff = rap[["numero", "tiers", "ttc", "piece", "methode"]].copy()
+                if "ventilation" not in rap: rap["ventilation"] = ""
+                rap["ventilation"] = rap["ventilation"].apply(lambda v: ", ".join(map(str, v)) if isinstance(v, (list, tuple)) else (str(v) if v else ""))
+                aff = rap[["numero", "tiers", "ttc", "piece", "ventilation", "methode"]].copy()
                 aff["piece"] = aff["piece"].replace("", "(aucune)")
                 ed2 = st.data_editor(aff, hide_index=True, use_container_width=True,
-                                     disabled=["numero", "tiers", "ttc", "methode"],
+                                     disabled=["numero", "tiers", "ttc", "ventilation", "methode"],
                                      column_config={"piece": st.column_config.SelectboxColumn("pièce", options=["(aucune)"] + pieces_noms)},
                                      key=f"ed_rapp_{ss.get('n_rapp', 0)}")
                 if st.button("Appliquer le rapprochement et régénérer"):
@@ -257,22 +271,62 @@ with tab1:
             st.dataframe(pd.DataFrame(rest, columns=["Fichier:ligne", "Anomalie", "Détail"]), use_container_width=True)
             st.download_button("Télécharger le rapport", open(r["rapport"], "rb").read(), file_name="rapport_anomalies.csv")
         st.subheader("Écritures")
-        st.caption("Touchez une ligne pour afficher la facture correspondante.")
         ecr = pd.DataFrame(r["ecritures"])
+        if "alerte" not in ecr: ecr["alerte"] = ""
+        ecr["alerte"] = ecr["alerte"].fillna("")
+        nb_al = int((ecr.drop_duplicates("num")["alerte"] != "").sum()) if len(ecr) else 0
+        if nb_al:
+            st.caption(f"🟡 {nb_al} écriture(s) en alerte (surlignées en jaune) : voir la colonne « alerte ».")
+        st.caption("Touchez une ligne pour afficher la facture correspondante.")
+        vue = ecr[["num", "date", "compte", "aux", "piece", "lib", "debit", "credit", "alerte"]].copy()
+        vue["date"] = pd.to_datetime(vue["date"]).dt.strftime("%d/%m/%Y")
+        for k in ("debit", "credit"):
+            vue[k] = vue[k].astype(float)
+        jaune = vue["alerte"] != ""
+        # une alerte colore toutes les lignes de l'écriture concernée
+        nums_al = set(vue.loc[jaune, "num"])
+        def _jaune(row):
+            return ["background-color: #FFF9C4; color: #000"] * len(row) if row["num"] in nums_al else [""] * len(row)
         sel = None
         try:
-            ev = st.dataframe(ecr[["num", "date", "compte", "aux", "piece", "lib", "debit", "credit"]],
+            ev = st.dataframe(vue.style.apply(_jaune, axis=1).format({"debit": "{:.2f}", "credit": "{:.2f}"}),
                               on_select="rerun", selection_mode="single-row", hide_index=True,
                               use_container_width=True, key="tbl_ecr")
             if ev.selection.rows:
                 sel = ecr.iloc[ev.selection.rows[0]]
-        except TypeError:                                   # anciennes versions de Streamlit
+        except Exception:                                   # anciennes versions de Streamlit
+            st.dataframe(vue.style.apply(_jaune, axis=1), hide_index=True, use_container_width=True)
             uniques = ecr.drop_duplicates("num")
             choix = st.selectbox("Facture à afficher", ["(aucune)"] + [f"{p.num} - {p.piece}" for p in uniques.itertuples()])
             if choix != "(aucune)":
                 sel = uniques[uniques["num"] == int(choix.split(" - ")[0])].iloc[0]
         if sel is not None:
             afficher_piece(sel)
+
+        with st.expander("✏️ Modifier les écritures", expanded=False):
+            st.caption("Modifiez comptes, libellés, montants ou dates ; ajoutez une ligne (+) en indiquant le n° d'écriture. "
+                       "Le débit doit égaler le crédit pour chaque écriture.")
+            cols_ed = ["num", "date", "compte", "libc", "aux", "auxl", "piece", "lib", "debit", "credit", "alerte"]
+            base = ecr[cols_ed].copy()
+            base["date"] = pd.to_datetime(base["date"]).dt.strftime("%Y-%m-%d")
+            for k in ("debit", "credit"):
+                base[k] = base[k].astype(float)
+            ed_e = st.data_editor(base, num_rows="dynamic", hide_index=True, use_container_width=True,
+                                  disabled=["alerte"], key=f"ed_ecr_{ss.get('n_ecr', 0)}")
+            if st.button("Valider mes modifications et régénérer le FEC"):
+                try:
+                    nv = ag.regenerer(ed_e, r["ecritures"], type_, siren, exercice, ss.tmp, comptes=comptes_ui()[0],
+                                      separateur="pipe" if ss.get("sep_fec") == "Pipe |" else "tab",
+                                      sources={os.path.basename(q): q for q in ss.get("index_chemins", {}).values()})
+                    pb = [(n, m) for n, m, b in ag.valider_ecritures(nv["ecritures"]) if not b]
+                    for e in nv["ecritures"]:
+                        e["alerte"] = " ; ".join(m for n, m in pb if n == e["num"]) or e.get("alerte", "")
+                    ss.res = {**r, **nv}
+                    ss.n_ecr = ss.get("n_ecr", 0) + 1
+                    rerun()
+                except ValueError as ex:
+                    st.error(str(ex))
+
 
 with tab2:
     st.caption("Si le nom du tiers contient le motif, le compte est utilisé. Colonne type : achat, vente, ou vide pour les deux. "
@@ -282,6 +336,11 @@ with tab2:
         ss.imput_base = base
         ss.pop("ed_imput", None)
         st.success(f"{n} règle(s) ajoutée(s).")
+    if st.button("🔄 Mettre à jour les comptes carburant / transport / hôtels du modèle"):
+        base, n = ag.migrer_modele(ss.get("imput_courant", ss.imput_base))
+        ss.imput_base = base
+        ss.pop("ed_imput", None)
+        st.success(f"{n} règle(s) migrée(s) (les lignes que vous avez modifiées sont conservées).")
     up = st.file_uploader("Importer ma table (CSV)", type="csv", key="imp_up")
     if up is not None and ss.get("imp_nom") != (up.name, up.size):
         tmp_csv = os.path.join(ss.tmp, "imputations_import.csv")
@@ -347,9 +406,23 @@ with tab3:
                                         use_container_width=True, key="ed_tva")
     with st.expander("🚫 TVA non déductible (achats)"):
         st.checkbox("Appliquer les règles de TVA non déductible", value=True, key="nd_actif")
-        st.caption("Règles de départ INDICATIVES, à valider selon le dossier (nature de la dépense, véhicule, activité). "
-                   "Motif : mot du nom du fournisseur ; compte : début du compte de charge ; % : part de TVA non déductible, "
-                   "ajoutée à la charge. Si motif et compte sont renseignés, les deux doivent correspondre.")
+        st.markdown("**⛽ Véhicule et carburant**")
+        v1, v2 = st.columns(2)
+        v1.selectbox("Type de véhicule", list(ag.VEHICULES), format_func=ag.VEHICULES.get, key="veh_type")
+        v2.selectbox("Carburant / énergie", [AUCUN] + list(ag.CARBURANTS), index=1, key="veh_carb")
+        st.text_input("Compte(s) de charge carburant (séparés par une virgule)", ag.COMPTE_CARBURANT_DEFAUT, key="veh_cpt")
+        carb = ss.get("veh_carb", "Gazole")
+        if carb in ag.CARBURANTS:
+            ded = ag.pct_deductible_carburant(ss.get("veh_type", "VP"), carb)
+            st.info(f"TVA déductible : **{ded} %** · non déductible : **{100 - ded} %** (ajoutée à la charge).")
+            rem = ag.CARBURANTS[carb][2]
+            if rem:
+                st.warning(rem)
+        else:
+            st.caption("Aucune règle carburant : la TVA du carburant est déduite en totalité.")
+        st.markdown("**📋 Autres règles, par compte**")
+        st.caption("Règles de départ INDICATIVES, à valider selon le dossier. Compte : début du compte de charge "
+                   "(ex. 6256 couvre 625610) ; % : part de TVA non déductible, ajoutée à la charge.")
         if st.button("Remettre les règles types"):
             ss.nd_base = ag.tva_nd_defaut_df()
             ss.pop("ed_nd", None)
@@ -362,7 +435,9 @@ with tab3:
     with st.expander("💾 Sauvegarde des réglages"):
         c, t, p = comptes_ui()
         st.download_button("⬇️ Télécharger mes réglages (reglages.json)",
-                           json.dumps(ag.exporter_reglages(c, t, p, ss.get("nd_courant", ss.nd_base).to_dict("records")), ensure_ascii=False, indent=2).encode("utf-8"),
+                           json.dumps(ag.exporter_reglages(c, t, p, ss.get("nd_courant", ss.nd_base).to_dict("records"),
+                                                   {"vehicule": ss.get("veh_type", "VP"), "carburant": ss.get("veh_carb", "Gazole"),
+                                                    "comptes": ss.get("veh_cpt", ag.COMPTE_CARBURANT_DEFAUT)}), ensure_ascii=False, indent=2).encode("utf-8"),
                            file_name="reglages.json", mime="application/json")
         st.caption("Pour les garder : ajoutez ce fichier à la racine de GitHub, il sera rechargé au démarrage.")
         rg = st.file_uploader("Restaurer des réglages (reglages.json)", type="json", key="reg_up")

@@ -12,7 +12,7 @@ PDF/images : Factur-X (XML intégré) -> texte du PDF (règles) -> OCR PaddleOCR
 -> IA Claude (facultatif, payant, si ANTHROPIC_API_KEY est défini).
 """
 import argparse, hashlib, io, json, os, re, shutil, sys, tempfile, unicodedata, zipfile
-VERSION = "2026.11.05-j"
+VERSION = "2026.11.06-k"
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from decimal import Decimal, ROUND_HALF_UP
@@ -131,19 +131,19 @@ def sauver_mapping(df, m, dossier="mappings"):
     os.makedirs(dossier, exist_ok=True)
     json.dump(m, open(os.path.join(dossier, f"{empreinte(df)}.json"), "w", encoding="utf-8"), indent=2, ensure_ascii=False)
 
-def exporter_reglages(comptes, tva_comptes, produits_tva=None, tva_nd=None, dossier="mappings"):
+def exporter_reglages(comptes, tva_comptes, produits_tva=None, tva_nd=None, vehicule=None, dossier="mappings"):
     """Tout ce qui se règle dans l'app, dans un dictionnaire sauvegardable (JSON)."""
     maps = {}
     if os.path.isdir(dossier):
         for f in os.listdir(dossier):
             if f.endswith(".json"): maps[f[:-5]] = json.load(open(os.path.join(dossier, f), encoding="utf-8"))
-    return {"comptes": comptes, "tva_comptes": tva_comptes, "produits_tva": produits_tva, "tva_nd": tva_nd, "mappings": maps}
+    return {"comptes": comptes, "tva_comptes": tva_comptes, "produits_tva": produits_tva, "tva_nd": tva_nd, "vehicule": vehicule, "mappings": maps}
 
 def importer_reglages(d, dossier="mappings"):
     os.makedirs(dossier, exist_ok=True)
     for emp, m in (d.get("mappings") or {}).items():
         json.dump(m, open(os.path.join(dossier, f"{emp}.json"), "w", encoding="utf-8"), indent=2, ensure_ascii=False)
-    return d.get("comptes"), d.get("tva_comptes"), d.get("produits_tva"), d.get("tva_nd")
+    return d.get("comptes"), d.get("tva_comptes"), d.get("produits_tva"), d.get("tva_nd"), d.get("vehicule")
 
 def charger_mapping(df, dossier="mappings"):
     chemin = os.path.join(dossier, f"{empreinte(df)}.json")
@@ -559,16 +559,35 @@ LEGAL = (r"siret|siren|\brcs\b|capital|n[°º]\s*(?:de\s*)?tva|tva\s*intra\w*|id
 SEP_LEGAL = (r"\s*[|·•]\s*|\s+[-–—]\s+|,\s|\s+(?:au\s+)?capital|\s+siret|\s+siren|\s+rcs|\s+n[°º]|\s+tva|\s+ape\b|"
              r"\s+naf\b|\s+immatricul|\s+soci[ée]t[ée]\s+[àa]")
 
+TITRE_MOTS = {"facture", "factures", "avoir", "invoice", "devis", "proforma", "pro", "forma", "acompte", "acomptes", "situation",
+              "recapitulatif", "releve", "decompte", "honoraires", "honoraire", "note", "bon", "recu", "quittance", "ticket",
+              "commande", "duplicata", "original", "copie", "reglement", "document", "piece", "detail", "detaillee", "definitive",
+              "provisoire", "rectificative", "complementaire", "finale", "intermediaire", "mensuelle", "trimestrielle",
+              "annuelle", "credit", "debit", "livraison", "echeancier", "attestation", "synthese"}
+TITRE_LIANTS = {"de", "du", "des", "la", "le", "les", "d", "l", "n", "no", "nr", "numero", "num", "et", "vente", "achat",
+                "service", "services", "prestation", "prestations", "travaux", "frais", "a", "au", "aux", "en", "sur", "pour",
+                "periode", "ref", "reference", "date"}
+
+def _est_titre(s):
+    """Vrai si le texte n'est qu'un titre de document (Facture, Note d'honoraires, Facture de situation n°2...)."""
+    jetons = [t for t in norm(s).split() if not re.fullmatch(r"n?[\d%.,/\-]+\w{0,2}", t)]   # "n°2" -> "n2" est un numéro
+    return all(t in TITRE_MOTS or t in TITRE_LIANTS for t in jetons)
+
 def _nom_valide(s):
     s = s.strip(" :-|")
     if len(re.findall(r"[A-Za-zÀ-ÿ]", s)) < 3 or "@" in s or re.search(r"\d{8,}", s.replace(" ", "")): return False
-    if re.match(NON_NOM, s, re.I) or re.match(r"^\d{5}\b", s): return False
+    if _est_titre(s) or re.match(NON_NOM, s, re.I) or re.match(r"^\d{5}\b", s): return False
+    if re.match(r"^n[°º]|^no\.?\s*\d", s, re.I): return False                         # "N° FA-2026-12" n'est pas un nom
+    if sum(c.isdigit() for c in s) > sum(c.isalpha() for c in s): return False         # plus de chiffres que de lettres : une référence
     if re.match(rf"^(?:\d{{1,4}}\s*(?:bis|ter)?[\s,]+)?{RUE}\b", s, re.I): return False
     return True
 
 def _nettoyer_nom(s):
-    s = re.sub(r"^(?:facture|avoir|invoice)\s+", "", s.strip(" :-|"), flags=re.I)
-    return re.split(r"\s{2,}|\s+(?:date|n[°º]|num[ée]ro|r[ée]f|page|t[ée]l|email|e-mail|siret|siren|tva)\b", s, 1, flags=re.I)[0].strip(" :-|")
+    s = s.strip(" :-|")
+    if _est_titre(s): return ""                                   # le titre du document n'est pas un tiers
+    s = re.sub(r"^(?:facture|avoir|invoice)\s+", "", s, flags=re.I)   # "Facture Dupont SARL" (titre collé au nom)
+    s = re.split(r"\s{2,}|\s+(?:date|n[°º]|num[ée]ro|r[ée]f|page|t[ée]l|email|e-mail|siret|siren|tva)\b", s, 1, flags=re.I)[0].strip(" :-|")
+    return "" if _est_titre(s) else s
 
 FORMES = {"sarl", "sas", "sasu", "eurl", "sa", "sci", "snc", "scop", "selarl", "earl", "gaec", "ets", "etablissements",
           "societe", "entreprise", "cie", "and", "les", "des", "du", "la", "le", "de", "et"}
@@ -834,9 +853,10 @@ def vers_pivot(df, m, anomalies, src=""):
 # ---------- Table d'imputation (fournisseur/client -> compte) ----------
 # Modèle de départ INDICATIF (plan comptable général) : à valider avec le plan de chaque dossier.
 _IMP = {
-    ("606100", "Fournitures non stockables (énergie, eau, carburant)"): [
+    ("606100", "Fournitures non stockables (énergie, eau)"): [
         "edf", "engie", "totalenergies", "total energies", "direct energie", "enedis", "grdf", "eni", "plenitude",
-        "ekwateur", "ilek", "mint energie", "veolia", "suez", "saur", "esso", "shell", "bp", "avia", "q8", "dkv"],
+        "ekwateur", "ilek", "mint energie", "veolia", "suez", "saur"],
+    ("606130", "Carburants"): ["esso", "shell", "bp", "avia", "q8", "dkv"],
     ("606300", "Fournitures d'entretien et petit équipement"): [
         "leroy merlin", "castorama", "brico depot", "bricomarche", "ikea", "amazon", "amazon business", "fnac", "darty",
         "boulanger", "cdiscount", "ldlc", "materiel net", "back market", "backmarket", "dell", "lenovo", "apple", "hp",
@@ -871,10 +891,12 @@ _IMP = {
         "colissimo", "chronopost", "dhl", "ups", "fedex", "tnt", "dpd", "gls", "mondial relay", "relais colis", "boxtal",
         "sendcloud", "packlink", "geodis", "schenker", "heppner"],
     ("625100", "Voyages, déplacements, péages et parkings"): [
-        "sncf", "ouigo", "air france", "easyjet", "ryanair", "transavia", "blablacar", "uber", "bolt", "g7", "ratp",
-        "navigo", "flixbus", "eurostar", "booking", "airbnb", "ibis", "accor", "novotel", "mercure", "campanile",
-        "kyriad", "vinci autoroutes", "sanef", "aprr", "escota", "cofiroute", "sapn", "indigo", "saemes", "onepark",
+        "vinci autoroutes", "sanef", "aprr", "escota", "cofiroute", "sapn", "indigo", "saemes", "onepark",
         "zenpark", "q park", "effia"],
+    ("625110", "Voyages : transport de personnes (train, avion, taxi)"): [
+        "sncf", "ouigo", "air france", "easyjet", "ryanair", "transavia", "blablacar", "uber", "bolt", "g7", "ratp",
+        "navigo", "flixbus", "eurostar"],
+    ("625610", "Missions : hébergement (hôtel)"): ["booking", "airbnb", "ibis", "accor", "novotel", "mercure", "campanile", "kyriad", "hotel"],
     ("625700", "Réceptions"): ["uber eats", "deliveroo", "just eat", "mcdonald", "restaurant", "traiteur"],
     ("626000", "Frais postaux et télécommunications"): [
         "orange", "sfr", "bouygues", "free", "free mobile", "la poste", "ringover", "aircall", "onoff", "wifirst", "lebara",
@@ -898,6 +920,23 @@ def charger_imputations(chemin="imputations.csv"):
         if c not in df.columns: df[c] = ""
     return df[COLS_IMPUT]
 
+ANCIENS_COMPTES = {"606100": ["esso", "shell", "bp", "avia", "q8", "dkv"],
+                   "625100": ["sncf", "ouigo", "air france", "easyjet", "ryanair", "transavia", "blablacar", "uber", "bolt", "g7",
+                              "ratp", "navigo", "flixbus", "eurostar", "booking", "airbnb", "ibis", "accor", "novotel",
+                              "mercure", "campanile", "kyriad"]}
+
+def migrer_modele(df):
+    """Met à jour les anciennes lignes du modèle (carburant, transport de personnes, hôtels) vers leurs nouveaux comptes,
+    sans toucher aux lignes que l'utilisateur a déjà modifiées. Renvoie (table, nombre de lignes migrées)."""
+    cible = {m: (c, l) for m, c, l, _ in IMPUT_DEFAUT}
+    df, n = df.copy(), 0
+    for i, r in df.iterrows():
+        m = norm(_s(r["motif"]))
+        if m in ANCIENS_COMPTES.get(_s(r["compte"]), []) and m in cible and cible[m][0] != _s(r["compte"]):
+            df.at[i, "compte"], df.at[i, "libelle"] = cible[m]
+            n += 1
+    return df, n
+
 def fusionner_modele(df):
     """Ajoute à la table les règles du modèle dont le motif n'y figure pas encore (ne modifie rien d'existant)."""
     connus = {norm(m) for m in df["motif"]}
@@ -920,38 +959,57 @@ def trouver_regle(tiers, regles, type_=None):
     return None
 
 # ---------- TVA non déductible (achats) ----------
-# Règles de DÉPART, INDICATIVES, à valider selon le dossier (nature de la dépense, véhicule, activité) et à paramétrer :
-# motif (mot du nom du tiers) et/ou préfixe de compte de charge -> % de TVA non déductible (incorporé à la charge).
-_ND = {
-    (100, "Hébergement : TVA non déductible"): ["hotel", "ibis", "novotel", "mercure", "campanile", "kyriad", "airbnb"],
-    (100, "Transport de personnes : TVA non déductible"): [
-        "sncf", "ouigo", "uber", "bolt", "g7", "taxi", "taxis", "ratp", "navigo", "flixbus", "blablacar", "eurostar",
-        "air france", "easyjet", "ryanair", "transavia"],
-    (20, "Carburant : 80 % déductible en général, selon véhicule et carburant (à valider)"): ["esso", "shell", "bp", "avia", "q8", "dkv"],
-}
-TVA_ND_DEFAUT = [(m, "", p, com) for (p, com), ms in _ND.items() for m in ms]
-COLS_ND = ["motif", "compte", "pct_non_deductible", "commentaire"]
+# Règles de DÉPART, INDICATIVES, à valider selon le dossier : par COMPTE de charge (début du numéro de compte),
+# % de TVA non déductible, incorporé à la charge. Le carburant est géré à part (véhicule + carburant, voir plus bas).
+COLS_ND = ["compte", "pct_non_deductible", "commentaire"]
+TVA_ND_DEFAUT = [
+    ("625110", 100, "Transport de personnes (train, avion, taxi, VTC) : TVA non déductible (art. 206 IV-2 annexe II CGI)"),
+    ("625610", 100, "Hébergement des dirigeants et salariés : TVA non déductible ; déductible pour l'hébergement d'un tiers (client)"),
+]
 
 def tva_nd_defaut_df():
     return pd.DataFrame(TVA_ND_DEFAUT, columns=COLS_ND)
 
-def preparer_nd(df):
+# --- Carburant : % de TVA DÉDUCTIBLE selon le véhicule (VP = véhicule de tourisme, VU = utilitaire) et l'énergie ---
+VEHICULES = {"VP": "VP · véhicule de tourisme", "VU": "VU · véhicule utilitaire"}
+CARBURANTS = {   # énergie -> (déductible VP, déductible VU, remarque)
+    "Gazole": (80, 100, ""),
+    "Essence (SP95, SP98, E10)": (80, 100, ""),
+    "Superéthanol E85": (80, 100, ""),
+    "GPL carburant (liquéfié)": (100, 100, "Sources divergentes en VP (80 % ou 100 %) : à valider."),
+    "GPL gazeux": (50, 100, "Limité à 50 % en VP selon la plupart des sources : à valider."),
+    "GNV (gaz naturel)": (100, 100, ""),
+    "Électricité (recharge)": (100, 100, "Hybrides : appliquer l'énergie réellement achetée (essence/gazole ou électricité)."),
+}
+COMPTE_CARBURANT_DEFAUT = "606130"
+
+def pct_deductible_carburant(vehicule, carburant):
+    vp, vu, _ = CARBURANTS.get(carburant, (80, 100, ""))
+    return vu if vehicule == "VU" else vp
+
+def regle_carburant(vehicule="VP", carburant="Gazole", comptes=COMPTE_CARBURANT_DEFAUT):
+    """Règles de TVA non déductible du carburant, pour chaque compte carburant (séparés par des virgules)."""
+    if carburant not in CARBURANTS: return []                  # None / inconnu : pas de règle carburant
+    ded = pct_deductible_carburant(vehicule, carburant)
+    rem = CARBURANTS.get(carburant, (0, 0, ""))[2]
+    com = f"Carburant : {vehicule} · {carburant} · {ded} % déductible" + (f" ({rem})" if rem else "")
+    return [(re.sub(r"\W", "", c), Decimal(100 - ded), com)
+            for c in str(comptes).replace(";", ",").split(",") if re.sub(r"\W", "", c)] if ded < 100 else []
+
+def preparer_nd(df, vehicule="VP", carburant="Gazole", comptes_carburant=COMPTE_CARBURANT_DEFAUT):
+    """Règles par compte (tableau modifiable) + règle carburant. Les lignes sans compte sont ignorées."""
     out = []
     for _, r in df.iterrows():
-        p = montant(_s(r.get("pct_non_deductible")))
-        motif, cpt = norm(_s(r.get("motif"))), re.sub(r"\W", "", _s(r.get("compte")))
-        if p is not None and 0 < p <= 100 and (motif or cpt):
-            out.append((motif, cpt, p, _s(r.get("commentaire"))))
-    return out
+        p, cpt = montant(_s(r.get("pct_non_deductible"))), re.sub(r"\W", "", _s(r.get("compte")))
+        if p is not None and 0 < p <= 100 and cpt:
+            out.append((cpt, p, _s(r.get("commentaire"))))
+    return out + regle_carburant(vehicule, carburant, comptes_carburant)
 
-def trouver_nd(tiers, compte, regles):
-    """Règle la plus précise : (motif + compte) > motif > compte. Renvoie (pourcentage, commentaire) ou None."""
-    n, best = norm(tiers), None
-    for motif, cpt, p, com in regles:
-        if motif and not re.search(rf"(?<![a-z0-9]){re.escape(motif)}(?![a-z0-9])", n): continue
-        if cpt and not compte.startswith(cpt): continue
-        spec = (bool(motif) + bool(cpt), len(motif) + len(cpt))
-        if best is None or spec > best[0]: best = (spec, p, com)
+def trouver_nd(compte, regles):
+    """Règle la plus précise = compte le plus long qui commence le compte de charge (à égalité, la 1re du tableau)."""
+    best = None
+    for cpt, p, com in regles:
+        if compte.startswith(cpt) and (best is None or len(cpt) > len(best[0])): best = (cpt, p, com)
     return (best[1], best[2]) if best else None
 
 SEUIL_CADEAU = 73   # € TTC par bénéficiaire et par an (art. 23 N, annexe IV du CGI) : à revérifier chaque année
@@ -960,7 +1018,7 @@ def msg_cadeau():
     return (f"Cadeau : TVA déductible seulement si la valeur est ≤ {SEUIL_CADEAU} € TTC par bénéficiaire et par an "
             "(seuil à vérifier pour l'année) ; au-delà, TVA non déductible. Relevé n° 2067 si le total des cadeaux dépasse 3 000 €.")
 
-INFOS = ("TVA non déductible appliquée",)      # messages informatifs : non surlignés
+INFOS = ("TVA non déductible appliquée", "Ventilation TVA lue sur la pièce")      # messages informatifs : non surlignés
 
 def tagger_alertes(ecritures, anomalies):
     """Ajoute à chaque écriture le texte des alertes/erreurs qui la concernent (colonne 'alerte')."""
@@ -1066,7 +1124,7 @@ def construire_ecritures(lignes, type_, anomalies, regles=None, comptes=None, tv
                 anomalies.append((x["n"], msg_cadeau(), numero))
             nd = Decimal("0")
             if type_ == "achat" and nd_regles:                   # TVA non déductible : incorporée à la charge
-                rg = trouver_nd(tiers, cpt, nd_regles)
+                rg = trouver_nd(cpt, nd_regles)
                 if rg:
                     nd = (x["tva"] * rg[0] / 100).quantize(Decimal("0.01"), ROUND_HALF_UP)
                     if (tiers, "nd") not in signales:
@@ -1143,6 +1201,14 @@ def _indexer_piece(chemin):
             v = textes_pdf(chemin)
             pages = v[0] if v else []
         texte = _norm_txt("\n".join(pages))
+        if chemin.lower().endswith(".pdf"):                      # Factur-X : le n° et les montants sont dans le XML intégré
+            try:
+                from pypdf import PdfReader
+                for n, c in PdfReader(chemin).attachments.items():
+                    if n.lower().endswith(".xml"):
+                        texte += "\n" + re.sub(r"<[^>]+>", " ", c[0].decode("utf-8", errors="replace"))
+            except Exception:
+                pass
         _IDX[cle] = {"chemin": chemin, "nom": os.path.basename(chemin), "pages": pages, "multi": len(pages) > 1,
                      "texte": texte,
                      "montants": {abs(m) for m in (montant(x) for x in re.findall(NB, texte)) if m is not None},
@@ -1166,7 +1232,23 @@ def _score_piece(f, info):
     if f["date"] in info["dates"]: s += 1; met.append("date")
     return s, met
 
-def rapprocher(lignes, pieces, manuels=None):
+def _ventilation_piece(info, page, ht, tva):
+    """Ventilation de TVA par taux lue dans la pièce (XML Factur-X, sinon texte du PDF), si elle retombe sur les totaux
+    de l'écriture. Renvoie [(taux, base HT, TVA)] avec au moins 2 taux, ou None."""
+    if info["chemin"].lower().endswith(".pdf") and not info["multi"]:
+        df = lire_facturx(info["chemin"], "achat")
+        if df is not None and len(df) >= 2:
+            vent = [(float(r["Taux TVA"] or 0), abs(montant(r["Total HT"]) or Decimal("0")), abs(montant(r["Total TVA"]) or Decimal("0")))
+                    for _, r in df.iterrows()]
+            if abs(sum(b for _, b, _ in vent) - abs(ht)) <= Decimal("0.05") and abs(sum(v for _, _, v in vent) - abs(tva)) <= Decimal("0.05"):
+                return vent
+    texte = info["pages"][int(page) - 1] if page and info["pages"] else info["texte"]
+    lignes = [l.strip() for l in _norm_txt(texte).splitlines() if l.strip()]
+    A, B = _taux_lignes(lignes)
+    vent = _ventiler([list(OrderedDict.fromkeys(A)), A, B], ht, tva)
+    return vent if vent and len(vent) >= 2 else None
+
+def rapprocher(lignes, pieces, manuels=None, ventiler=True):
     """Associe chaque facture du fichier comptable à sa pièce (n° de facture dans le nom ou le texte du PDF,
     sinon montant + tiers + date). Renseigne l['pj'] / l['pj_page'] et renvoie le détail du rapprochement."""
     infos = [_indexer_piece(p) for p in pieces]
@@ -1200,12 +1282,27 @@ def rapprocher(lignes, pieces, manuels=None):
         if nom and par_nom[nom]["multi"] and sum(1 for v in res.values() if v[0] == nom) >= 2:
             rx = facts[k]["rx"]
             pages[k] = next((str(i) for i, p in enumerate(par_nom[nom]["pages"], 1) if rx and rx.search(p)), "")
+    cle_de = lambda l: f"{l['n'].rsplit(':', 1)[0]}|{l['numero']}"
+    ventile = {}
+    if ventiler:                                              # multi-taux : ventilation relue sur la pièce rapprochée
+        for k, (nom, sc, met) in res.items():
+            if not nom or k not in facts: continue
+            inv = [l for l in lignes if cle_de(l) == k]
+            if not inv or len({l["taux"] for l in inv}) != 1 or len({l["compte"] for l in inv}) != 1: continue
+            vent = _ventilation_piece(par_nom[nom], pages.get(k, ""), facts[k]["ht"], facts[k]["tva"])
+            if not vent: continue
+            sg = -1 if facts[k]["ht"] < 0 else 1
+            neuves = [dict(inv[0], ht=sg * b, tva=sg * v, ttc=sg * (b + v), taux=taux_str(r)) for r, b, v in vent]
+            pos = lignes.index(inv[0])
+            lignes[:] = [l for l in lignes if cle_de(l) != k]
+            lignes[pos:pos] = neuves
+            ventile[k] = " + ".join(f"{taux_str(r)} %" for r, _, _ in vent)
     for l in lignes:
-        k = f"{l['n'].rsplit(':', 1)[0]}|{l['numero']}"
+        k = cle_de(l)
         if res.get(k, ("",))[0]:
             l["pj"], l["pj_page"] = res[k][0], pages.get(k, "")
     return [{"cle": k, "numero": f["numero"], "tiers": f["tiers"], "ttc": str(f["ttc"]),
-             "piece": res.get(k, ("",))[0], "page": pages.get(k, ""),
+             "piece": res.get(k, ("",))[0], "page": pages.get(k, ""), "ventilation": ventile.get(k, ""),
              "methode": ", ".join(res[k][2]) if k in res else "aucune pièce trouvée"} for k, f in facts.items()]
 
 def creer_archive(ecritures, fec, sources, type_, comptes=None):
@@ -1265,12 +1362,13 @@ def ecritures_depuis_df(df, originaux):
     par_num = {}
     for e in originaux: par_num.setdefault(e["num"], e)
     out = []
-    for _, r in df.iterrows():
-        try: num = int(float(r["num"]))
-        except (TypeError, ValueError): continue
-        o = par_num.get(num, {})
+    for i, (_, r) in enumerate(df.iterrows(), 1):
         deb, cre = montant(_s(r["debit"])) or Decimal("0"), montant(_s(r["credit"])) or Decimal("0")
-        if not _s(r["compte"]) and not deb and not cre: continue
+        if not _s(r["compte"]) and not deb and not cre: continue                 # ligne vide : ignorée
+        try: num = int(float(r["num"]))
+        except (TypeError, ValueError):
+            raise ValueError(f"ligne {i} du tableau : indiquez le n° d'écriture auquel elle appartient")
+        o = par_num.get(num, {})
         try: d = pd.to_datetime(r["date"]).to_pydatetime()
         except Exception: d = o.get("date") or datetime.now()
         if pd.isna(d): d = o.get("date") or datetime.now()
@@ -1290,7 +1388,8 @@ def regenerer(df, originaux, type_, siren, exercice, sortie, comptes=None, separ
     return dict(ecritures=ecr, fec=fec, zip=creer_archive(ecr, fec, sources or {}, type_, comptes), total=total)
 
 def traiter(fichiers, type_="vente", siren="000000000", exercice="", sortie=".", regles=None,
-            mappings=None, comptes=None, tva_comptes=None, separateur="tab", tiers_corriges=None, pieces=None, rapprochements=None, produits_tva=None, tva_nd=None, tiers_au_compte=True, ventilations=None):
+            mappings=None, comptes=None, tva_comptes=None, separateur="tab", tiers_corriges=None, pieces=None, rapprochements=None, produits_tva=None, tva_nd=None, tiers_au_compte=True, ventilations=None,
+            vehicule="VP", carburant="Gazole", comptes_carburant=COMPTE_CARBURANT_DEFAUT, ventiler_pieces=True):
     anomalies, lignes = [], []
     for f in fichiers:
         nom = os.path.basename(f)
@@ -1334,8 +1433,10 @@ def traiter(fichiers, type_="vente", siren="000000000", exercice="", sortie=".",
             if inv:
                 multi.append({"cle": f"{a[0]}|{a[2]}", "numero": a[2], "tiers": inv[0]["tiers"],
                               "ht": str(sum(l["ht"] for l in inv)), "tva": str(sum(l["tva"] for l in inv))})
-    rapp = rapprocher(lignes, pieces, rapprochements) if pieces else []
+    rapp = rapprocher(lignes, pieces, rapprochements, ventiler_pieces) if pieces else []
     for rr in rapp:
+        if rr.get("ventilation"):
+            anomalies.append((rr["cle"].split("|")[0], f"Ventilation TVA lue sur la pièce : {rr['ventilation']}", rr["numero"]))
         if not rr["piece"]:
             anomalies.append((rr["cle"].split("|")[0], "Pièce justificative non trouvée (" + rr["methode"] + ")", rr["numero"]))
     factures = list(OrderedDict(((f"{l['n'].rsplit(':', 1)[0]}|{l['numero']}"),
@@ -1344,7 +1445,8 @@ def traiter(fichiers, type_="vente", siren="000000000", exercice="", sortie=".",
     ecr = construire_ecritures(lignes, type_, anomalies,
                                preparer_regles(regles if regles is not None else charger_imputations()),
                                comptes, tva_comptes, produits_tva,
-                               preparer_nd(tva_nd if tva_nd is not None else tva_nd_defaut_df()), tiers_au_compte)
+                               preparer_nd(tva_nd if tva_nd is not None else tva_nd_defaut_df(), vehicule, carburant, comptes_carburant),
+                               tiers_au_compte)
     tagger_alertes(ecr, anomalies)
     fec, total = ecrire_fec(ecr, type_, siren, exercice, sortie, comptes, separateur)
     sources = {os.path.basename(f): f for f in list(fichiers) + list(pieces or [])}

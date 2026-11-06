@@ -1,25 +1,25 @@
 motif;compte;libelle;type
-avia;606100;Fournitures non stockables (énergie, eau, carburant);achat
-bp;606100;Fournitures non stockables (énergie, eau, carburant);achat
-direct energie;606100;Fournitures non stockables (énergie, eau, carburant);achat
-dkv;606100;Fournitures non stockables (énergie, eau, carburant);achat
-edf;606100;Fournitures non stockables (énergie, eau, carburant);achat
-ekwateur;606100;Fournitures non stockables (énergie, eau, carburant);achat
-enedis;606100;Fournitures non stockables (énergie, eau, carburant);achat
-engie;606100;Fournitures non stockables (énergie, eau, carburant);achat
-eni;606100;Fournitures non stockables (énergie, eau, carburant);achat
-esso;606100;Fournitures non stockables (énergie, eau, carburant);achat
-grdf;606100;Fournitures non stockables (énergie, eau, carburant);achat
-ilek;606100;Fournitures non stockables (énergie, eau, carburant);achat
-mint energie;606100;Fournitures non stockables (énergie, eau, carburant);achat
-plenitude;606100;Fournitures non stockables (énergie, eau, carburant);achat
-q8;606100;Fournitures non stockables (énergie, eau, carburant);achat
-saur;606100;Fournitures non stockables (énergie, eau, carburant);achat
-shell;606100;Fournitures non stockables (énergie, eau, carburant);achat
-suez;606100;Fournitures non stockables (énergie, eau, carburant);achat
-total energies;606100;Fournitures non stockables (énergie, eau, carburant);achat
-totalenergies;606100;Fournitures non stockables (énergie, eau, carburant);achat
-veolia;606100;Fournitures non stockables (énergie, eau, carburant);achat
+direct energie;606100;Fournitures non stockables (énergie, eau);achat
+edf;606100;Fournitures non stockables (énergie, eau);achat
+ekwateur;606100;Fournitures non stockables (énergie, eau);achat
+enedis;606100;Fournitures non stockables (énergie, eau);achat
+engie;606100;Fournitures non stockables (énergie, eau);achat
+eni;606100;Fournitures non stockables (énergie, eau);achat
+grdf;606100;Fournitures non stockables (énergie, eau);achat
+ilek;606100;Fournitures non stockables (énergie, eau);achat
+mint energie;606100;Fournitures non stockables (énergie, eau);achat
+plenitude;606100;Fournitures non stockables (énergie, eau);achat
+saur;606100;Fournitures non stockables (énergie, eau);achat
+suez;606100;Fournitures non stockables (énergie, eau);achat
+total energies;606100;Fournitures non stockables (énergie, eau);achat
+totalenergies;606100;Fournitures non stockables (énergie, eau);achat
+veolia;606100;Fournitures non stockables (énergie, eau);achat
+avia;606130;Carburants;achat
+bp;606130;Carburants;achat
+dkv;606130;Carburants;achat
+esso;606130;Carburants;achat
+q8;606130;Carburants;achat
+shell;606130;Carburants;achat
 amazon;606300;Fournitures d'entretien et petit équipement;achat
 amazon business;606300;Fournitures d'entretien et petit équipement;achat
 apple;606300;Fournitures d'entretien et petit équipement;achat
@@ -208,40 +208,41 @@ schenker;624100;Transports (colis et expéditions);achat
 sendcloud;624100;Transports (colis et expéditions);achat
 tnt;624100;Transports (colis et expéditions);achat
 ups;624100;Transports (colis et expéditions);achat
-accor;625100;Voyages, déplacements, péages et parkings;achat
-air france;625100;Voyages, déplacements, péages et parkings;achat
-airbnb;625100;Voyages, déplacements, péages et parkings;achat
 aprr;625100;Voyages, déplacements, péages et parkings;achat
-blablacar;625100;Voyages, déplacements, péages et parkings;achat
-bolt;625100;Voyages, déplacements, péages et parkings;achat
-booking;625100;Voyages, déplacements, péages et parkings;achat
-campanile;625100;Voyages, déplacements, péages et parkings;achat
 cofiroute;625100;Voyages, déplacements, péages et parkings;achat
-easyjet;625100;Voyages, déplacements, péages et parkings;achat
 effia;625100;Voyages, déplacements, péages et parkings;achat
 escota;625100;Voyages, déplacements, péages et parkings;achat
-eurostar;625100;Voyages, déplacements, péages et parkings;achat
-flixbus;625100;Voyages, déplacements, péages et parkings;achat
-g7;625100;Voyages, déplacements, péages et parkings;achat
-ibis;625100;Voyages, déplacements, péages et parkings;achat
 indigo;625100;Voyages, déplacements, péages et parkings;achat
-kyriad;625100;Voyages, déplacements, péages et parkings;achat
-mercure;625100;Voyages, déplacements, péages et parkings;achat
-navigo;625100;Voyages, déplacements, péages et parkings;achat
-novotel;625100;Voyages, déplacements, péages et parkings;achat
 onepark;625100;Voyages, déplacements, péages et parkings;achat
-ouigo;625100;Voyages, déplacements, péages et parkings;achat
 q park;625100;Voyages, déplacements, péages et parkings;achat
-ratp;625100;Voyages, déplacements, péages et parkings;achat
-ryanair;625100;Voyages, déplacements, péages et parkings;achat
 saemes;625100;Voyages, déplacements, péages et parkings;achat
 sanef;625100;Voyages, déplacements, péages et parkings;achat
 sapn;625100;Voyages, déplacements, péages et parkings;achat
-sncf;625100;Voyages, déplacements, péages et parkings;achat
-transavia;625100;Voyages, déplacements, péages et parkings;achat
-uber;625100;Voyages, déplacements, péages et parkings;achat
 vinci autoroutes;625100;Voyages, déplacements, péages et parkings;achat
 zenpark;625100;Voyages, déplacements, péages et parkings;achat
+air france;625110;Voyages : transport de personnes (train, avion, taxi);achat
+blablacar;625110;Voyages : transport de personnes (train, avion, taxi);achat
+bolt;625110;Voyages : transport de personnes (train, avion, taxi);achat
+easyjet;625110;Voyages : transport de personnes (train, avion, taxi);achat
+eurostar;625110;Voyages : transport de personnes (train, avion, taxi);achat
+flixbus;625110;Voyages : transport de personnes (train, avion, taxi);achat
+g7;625110;Voyages : transport de personnes (train, avion, taxi);achat
+navigo;625110;Voyages : transport de personnes (train, avion, taxi);achat
+ouigo;625110;Voyages : transport de personnes (train, avion, taxi);achat
+ratp;625110;Voyages : transport de personnes (train, avion, taxi);achat
+ryanair;625110;Voyages : transport de personnes (train, avion, taxi);achat
+sncf;625110;Voyages : transport de personnes (train, avion, taxi);achat
+transavia;625110;Voyages : transport de personnes (train, avion, taxi);achat
+uber;625110;Voyages : transport de personnes (train, avion, taxi);achat
+accor;625610;Missions : hébergement (hôtel);achat
+airbnb;625610;Missions : hébergement (hôtel);achat
+booking;625610;Missions : hébergement (hôtel);achat
+campanile;625610;Missions : hébergement (hôtel);achat
+hotel;625610;Missions : hébergement (hôtel);achat
+ibis;625610;Missions : hébergement (hôtel);achat
+kyriad;625610;Missions : hébergement (hôtel);achat
+mercure;625610;Missions : hébergement (hôtel);achat
+novotel;625610;Missions : hébergement (hôtel);achat
 deliveroo;625700;Réceptions;achat
 just eat;625700;Réceptions;achat
 mcdonald;625700;Réceptions;achat
