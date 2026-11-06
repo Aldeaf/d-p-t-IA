@@ -92,17 +92,37 @@ def lire_mem(nom):
             return ag.lire(ch[nom])
     return cache_session(("lire", nom, len(ss.mem.get(nom, b""))), calc)
 
-def images_pdf(nom, page):
-    """Pages d'un PDF converties en images, lues directement en mémoire."""
+def images_pdf(nom, page, recadrer=True, res=200):
+    """Pages d'un PDF en images nettes (200 dpi), marges blanches recadrées pour agrandir le texte."""
     def calc():
         import pdfplumber
         out = []
         with pdfplumber.open(io.BytesIO(ss.mem[nom])) as pdf:
             pages = [pdf.pages[int(page) - 1]] if page else pdf.pages[:4]
             for pg in pages:
-                b = io.BytesIO(); pg.to_image(resolution=110).original.save(b, format="PNG"); out.append(b.getvalue())
+                zone = pg
+                if recadrer:
+                    objs = [o for o in list(pg.chars) + list(pg.images) if str(o.get("text", "x")).strip()]   # texte + images
+                    if objs:
+                        m = 14
+                        x0 = max(float(pg.bbox[0]), min(float(o["x0"]) for o in objs) - m)
+                        x1 = min(float(pg.bbox[2]), max(float(o["x1"]) for o in objs) + m)
+                        y0 = max(float(pg.bbox[1]), min(float(o["top"]) for o in objs) - m)
+                        y1 = min(float(pg.bbox[3]), max(float(o["bottom"]) for o in objs) + m)
+                        if x1 - x0 > 50 and y1 - y0 > 50:
+                            try: zone = pg.crop((x0, y0, x1, y1))
+                            except Exception: zone = pg
+                b = io.BytesIO(); zone.to_image(resolution=res).original.save(b, format="PNG"); out.append(b.getvalue())
         return out
-    return cache_session(("img", nom, page), calc)
+    return cache_session(("img", nom, page, recadrer, res), calc)
+
+if hasattr(st, "dialog"):
+    @st.dialog("🧾 Facture", width="large")
+    def facture_en_grand(images):
+        for im in images:
+            st.image(im, use_container_width=True)
+else:
+    facture_en_grand = None
 
 def effacer_tout():
     """Efface fichiers, résultats et corrections de la session (les réglages sont conservés)."""
@@ -198,9 +218,22 @@ def afficher_piece(e):
     ext = os.path.splitext(nom)[1].lower()
     try:
         if ext == ".pdf":
-            for img in images_pdf(nom, e["page"]):
+            c1, c2, c3 = st.columns(3)
+            c3.download_button("📄 Ouvrir le PDF", b, file_name=nom, mime="application/pdf", key="apercu_pdf",
+                               use_container_width=True, help="Ouvre la facture d'origine dans le lecteur PDF (zoom net)")
+            recadrer = c1.toggle("Recadrer les marges", value=True, key="apercu_recadre") if hasattr(st, "toggle") \
+                else c1.checkbox("Recadrer les marges", value=True, key="apercu_recadre")
+            imgs = images_pdf(nom, e["page"], recadrer)
+            if c2.button("🔍 Agrandir", key="apercu_grand", use_container_width=True):
+                if facture_en_grand: facture_en_grand(imgs)
+                else: ss.apercu_plein = True
+            if ss.get("apercu_plein") and not facture_en_grand:
+                with st.expander("🔍 Facture en grand", expanded=True):
+                    for img in imgs: st.image(img, use_container_width=True)
+            for img in imgs:
                 st.image(img, use_container_width=True)
         elif ext in (".png", ".jpg", ".jpeg"):
+            if facture_en_grand and st.button("🔍 Agrandir", key="apercu_grand_img"): facture_en_grand([b])
             st.image(b, use_container_width=True)
         elif ext == ".xml":
             st.code(b.decode("utf-8", errors="replace")[:4000], language="xml")
@@ -452,7 +485,7 @@ with tab1:
             st.caption(f"🟡 {nb_al} écriture(s) en alerte (surlignées en jaune) : voir la colonne « alerte ».")
         if nb_vert:
             st.caption(f"🟢 {nb_vert} écriture(s) hors dates d'exercice mais traitées (vert pâle) : voir la colonne « remarque ».")
-        col_ecr, col_apercu = st.columns([3, 2], gap="medium")   # ordinateur : tableau à gauche, facture à droite
+        col_ecr, col_apercu = st.columns([1, 1], gap="medium")   # ordinateur : tableau à gauche, facture à droite
         with col_ecr:
             st.caption("Touchez une ligne pour afficher la facture correspondante.")
             vue = ecr[["num", "date", "date_piece", "compte", "aux", "piece", "lib", "debit", "credit", "alerte", "note"]].copy()
