@@ -12,7 +12,7 @@ PDF/images : Factur-X (XML intégré) -> texte du PDF (règles) -> OCR PaddleOCR
 -> IA Claude (facultatif, payant, si ANTHROPIC_API_KEY est défini).
 """
 import argparse, hashlib, io, json, os, re, shutil, sys, tempfile, unicodedata, zipfile
-VERSION = "2026.11.06-r"
+VERSION = "2026.11.06-s"
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from decimal import Decimal, ROUND_HALF_UP
@@ -804,6 +804,8 @@ def _nom_valide(s):
     s = s.strip(" :-|")
     if len(re.findall(r"[A-Za-zÀ-ÿ]", s)) < 3 or "@" in s or re.search(r"\d{8,}", s.replace(" ", "")): return False
     if _est_titre(s) or re.match(NON_NOM, s, re.I) or re.match(r"^\d{5}\b", s): return False
+    if norm(s) and all(t in FORMES or t in FORMES_DEBUT for t in norm(s).split()): return False   # « SAS » seul
+    if re.match(r"(?:capital|rcs|r\.c\.s|code\s*naf|naf|ape|n[°º]\s*tva|tva\s*intra|siret|siren|iban|bic)\b", s, re.I): return False
     if re.match(r"^n[°º]|^no\.?\s*\d", s, re.I): return False                         # "N° FA-2026-12" n'est pas un nom
     if s.count("/") >= 2 or re.fullmatch(r"[A-ZÀ-Ý ]+(?:\s*[/,&-]\s*[A-ZÀ-Ý ]+){2,}", s): return False   # « MAÇONNERIE / CARRELAGE / ISOLATION »
     if sum(c.isdigit() for c in s) > sum(c.isalpha() for c in s): return False         # plus de chiffres que de lettres : une référence
@@ -815,6 +817,7 @@ def _nettoyer_nom(s):
     if _est_titre(s): return ""                                   # le titre du document n'est pas un tiers
     s = re.sub(r"^(?:facture|avoir|invoice)\s+", "", s, flags=re.I)   # "Facture Dupont SARL" (titre collé au nom)
     s = re.split(r"\s{2,}|\s+(?:date|n[°º]|num[ée]ro|r[ée]f|page|t[ée]l|email|e-mail|siret|siren|tva)\b", s, 1, flags=re.I)[0].strip(" :-|")
+    s = re.split(r"(?<=\w)\s+(?=(?:M\.|Mme|Mlle|Mr\.?|Monsieur|Madame)\s+[A-ZÀ-Ý&])", s, 1)[0].strip(" :-|")   # 2 colonnes fusionnées
     return "" if _est_titre(s) else s
 
 FORMES = {"sarl", "sas", "sasu", "eurl", "sa", "sci", "snc", "scop", "selarl", "earl", "gaec", "ets", "etablissements",
@@ -837,14 +840,104 @@ def _emetteur_legal(lignes):
 CIVILITE = (r"\b(?:M\.?\s*(?:&|et)\s*Mme|Mme\s*(?:&|et)\s*M\.?|Monsieur\s*(?:&|et)\s*Madame|Madame\s*(?:&|et)\s*Monsieur|"
             r"M\.|Mr\.?|Mme|Mlle|Monsieur|Madame)\s+[A-ZÀ-Ý][\w'’\-]+(?:\s+(?:[A-ZÀ-Ý][\w'’\-]+|de|du|d'|le|la)){0,4}")
 
-def _tiers_texte(lignes, type_):
+def _compact(x):
+    return re.sub(r"[^a-z0-9]", "", norm(x))
+
+def _preuves_emetteur(lignes):
+    """Indices de l'identité de l'ÉMETTEUR de la facture : nom des mentions légales, domaines web / e-mail proches
+    des mentions légales, titulaire du compte bancaire. Sert à ne jamais le prendre pour le client."""
+    noms, domaines = [], set()
+    em = _emetteur_legal(lignes)
+    if em: noms.append(em)
+    for i, l in enumerate(lignes):
+        legal = re.search(LEGAL + r"|\biban\b|\bbic\b", l, re.I) and not re.match(rf"\s*{LABELS_ACHETEUR}\b", l, re.I)
+        for d in re.findall(r"www\.([a-z0-9\-]+)\.", l, re.I): domaines.add(d.replace("-", "").lower())
+        if legal:
+            for x in lignes[max(0, i - 3):i + 4]:
+                for d in re.findall(r"@([a-z0-9\-]+)\.", x, re.I): domaines.add(d.replace("-", "").lower())
+        m = re.search(r"titulaire(?:\s*du\s*compte)?\s*:?\s*(.+)$", l, re.I)
+        if m:
+            c = _nettoyer_nom(m.group(1))
+            if c and _nom_valide(c): noms.append(c)
+    domaines -= {"gmail", "hotmail", "yahoo", "orange", "free", "wanadoo", "outlook", "laposte", "sfr", "icloud", "live", "aol", "neuf", "bbox"}
+    return {"noms": noms, "domaines": {d for d in domaines if len(d) >= 4}}
+
+def _est_emetteur(c, preuves):
+    if not c: return False
+    cc = _compact(c)
+    for n in preuves["noms"]:
+        if _meme_societe(c, n) or (len(cc) >= 4 and (cc in _compact(n) or _compact(n) in cc)): return True
+    return any(d in cc or (len(cc) >= 4 and cc in d) for d in preuves["domaines"])
+
+def _blocs_haut(fichier, max_pages=10):
+    """Par page : texte des blocs gauche et droit du haut de page (zone des adresses émetteur / destinataire)."""
+    out = []
+    try:
+        import pdfplumber
+        with pdfplumber.open(fichier) as pdf:
+            for page in pdf.pages[:max_pages]:
+                W, H = float(page.width), float(page.height)
+                lignes = OrderedDict()
+                for w in page.extract_words(keep_blank_chars=False, use_text_flow=False):
+                    if float(w["top"]) > 0.45 * H: continue
+                    lignes.setdefault(round(float(w["top"]) / 3), []).append(w)
+                gauche, droite = [], []
+                for _, ws in sorted(lignes.items()):
+                    ws = sorted(ws, key=lambda w: float(w["x0"]))
+                    segs, cur = [], [ws[0]]
+                    for a, b in zip(ws, ws[1:]):
+                        if float(b["x0"]) - float(a["x1"]) > 18: segs.append(cur); cur = [b]
+                        else: cur.append(b)
+                    segs.append(cur)
+                    for sg in segs:
+                        txt = " ".join(w["text"] for w in sg)
+                        (droite if float(sg[0]["x0"]) >= 0.45 * W else gauche).append(txt)
+                out.append({"gauche": gauche, "droite": droite})
+    except Exception:
+        pass
+    return out
+
+def _nom_du_bloc(bloc, preuves):
+    """1er nom plausible d'un bloc d'adresse (après un éventuel libellé « Client : »), hors émetteur."""
+    for l in bloc[:10]:
+        m = re.match(rf"\s*{ETIQ['vente']}\b\s*:?\s*(.*)$", l, re.I)
+        cand = m.group(1) if m else l
+        c = _nettoyer_nom(cand)
+        if c and _nom_valide(c) and not re.search(r"\d{5}|@|www\.|t[ée]l|port\.|fax", c, re.I):
+            return "" if _est_emetteur(c, preuves) else c
+    return ""
+
+def _client_par_position(blocs, preuves, lignes):
+    """Client = bloc (gauche ou droit) qui n'est pas celui de l'émetteur ; à défaut le bloc de droite (fenêtre d'enveloppe)."""
+    if not blocs: return ""
+    g, d = blocs.get("gauche", []), blocs.get("droite", [])
+    def emetteur_dans(b):
+        return any(_est_emetteur(_nettoyer_nom(x), preuves) or re.search(LEGAL, x, re.I) for x in b[:10])
+    premier = next((_nettoyer_nom(l) for l in lignes[:3] if _nettoyer_nom(l) and _nom_valide(_nettoyer_nom(l))), "")
+    ordre = [d, g]
+    if emetteur_dans(d) and not emetteur_dans(g): ordre = [g]
+    elif emetteur_dans(g) and not emetteur_dans(d): ordre = [d]
+    elif premier and any(_meme_societe(premier, _nettoyer_nom(x)) for x in d[:3]): ordre = [g]   # en-tête à droite
+    for b in ordre:
+        c = _nom_du_bloc(b, preuves)
+        if c and not (premier and _meme_societe(c, premier) and b is not ordre[0]): return c
+    return ""
+
+def _tiers_texte(lignes, type_, blocs=None):
+    preuves = _preuves_emetteur(lignes)
+    em = preuves["noms"][0] if preuves["noms"] else ""
+    pas_emetteur = (lambda c: not _est_emetteur(c, preuves)) if type_ == "vente" else (lambda c: True)
     for i, l in enumerate(lignes):                                  # 1. libellé explicite
         m = re.match(rf"\s*{ETIQ[type_]}\b\s*:?\s*(.*)$", l, re.I)
         if not m: continue
         for cand in [m.group(1)] + lignes[i + 1:i + 5]:
             c = _nettoyer_nom(cand)
-            if c and _nom_valide(c): return c
-    em = _emetteur_legal(lignes)                                    # 2. mentions légales de l'émetteur
+            if c and _nom_valide(c):
+                if pas_emetteur(c): return c
+                # libellé « Client » suivi du nom de l'émetteur (2 colonnes fusionnées) : texte restant à droite
+                if em and norm(cand).startswith(norm(em)[:max(4, len(norm(em)) - 2)]):
+                    reste = _nettoyer_nom(cand[len(em):])
+                    if reste and _nom_valide(reste) and pas_emetteur(reste): return reste
     if type_ == "achat":
         if em: return em
         skip = 0                                                    # 3. sinon 1re ligne hors bloc client
@@ -853,25 +946,27 @@ def _tiers_texte(lignes, type_):
             if re.match(rf"\s*{LABELS_ACHETEUR}\b", l, re.I): skip = 4; continue
             c = _nettoyer_nom(l)
             if c and _nom_valide(c): return c
-    else:                                                           # client : particulier avec civilité
-        for l in lignes[:20]:
-            m = re.search(CIVILITE, l)
-            if m and not re.search(LEGAL + r"|certifi|qualit[ée]|g[ée]rant|repr[ée]sent", l, re.I):
-                c = _nettoyer_nom(m.group(0))
-                if c and _nom_valide(c) and not (em and _meme_societe(c, em)): return c
-    if type_ != "achat" and em:                                     # client : texte à droite du nom de l'émetteur (2 colonnes)
+        return ""
+    for l in lignes[:20]:                                           # 2. particulier avec civilité
+        m = re.search(CIVILITE, l)
+        if m and not re.search(LEGAL + r"|certifi|qualit[ée]|g[ée]rant|repr[ée]sent", l, re.I):
+            c = _nettoyer_nom(m.group(0))
+            if c and _nom_valide(c) and pas_emetteur(c): return c
+    c = _client_par_position(blocs, preuves, lignes)               # 3. position du bloc adresse sur la page
+    if c: return c
+    if em:                                                          # 4. texte à droite du nom de l'émetteur (2 colonnes)
         for l in lignes[:15]:
             if _meme_societe(l, em) and norm(l).startswith(norm(em)) and len(norm(l)) > len(norm(em)) + 3:
                 reste = l[len(em):] if l.lower().startswith(em.lower()) else ""
                 c = _nettoyer_nom(reste)
-                if c and _nom_valide(c) and not _meme_societe(c, em): return c
-    if type_ != "achat" and em:                                     # client : 1re ligne qui n'est pas l'émetteur
+                if c and _nom_valide(c) and pas_emetteur(c): return c
+    if preuves["noms"] or preuves["domaines"]:                      # 5. 1re ligne qui n'est pas l'émetteur
         for l in lignes[:15]:
             c = _nettoyer_nom(l)
-            if c and _nom_valide(c) and not _meme_societe(c, em): return c
+            if c and _nom_valide(c) and pas_emetteur(c) and not re.search(r"\d{5}|@|www\.", c): return c
     return ""
 
-def lire_texte(texte, type_, nom):
+def lire_texte(texte, type_, nom, blocs=None):
     """Extraction par règles à partir du texte d'une facture (une facture par document)."""
     t = _norm_txt(texte)
     lignes = [l.strip() for l in t.splitlines() if l.strip()]
@@ -924,7 +1019,7 @@ def lire_texte(texte, type_, nom):
         anom.append(("Autoliquidation de TVA : écritures de TVA à traiter manuellement", numero))
     if re.search(r"\b(?:USD|GBP|CHF)\b|[$£]", t) and not re.search(r"€|\bEUR\b|euros?", t, re.I):
         anom.append(("Devise autre que l'euro : montants à convertir", numero))
-    tiers = _tiers_texte(lignes, type_)
+    tiers = _tiers_texte(lignes, type_, blocs)
     if not tiers:
         tiers = "A IDENTIFIER"; anom.append(("Tiers non identifié", numero))
     d = _date_texte(t)
@@ -934,13 +1029,13 @@ def lire_texte(texte, type_, nom):
     df.attrs["anomalies"], df.attrs["numero_trouve"] = anom, trouve
     return df
 
-def _lire_pages(pages, type_, nom):
+def _lire_pages(pages, type_, nom, blocs=None):
     """Un PDF peut contenir plusieurs factures (une par page) : on les sépare si les numéros diffèrent."""
     if len(pages) > 1:
         res = []
         for i, p in enumerate(pages, 1):
             if len(p.strip()) < 40: continue
-            d = lire_texte(p, type_, f"{nom}-p{i}")
+            d = lire_texte(p, type_, f"{nom}-p{i}", (blocs or [None] * i)[i - 1] if blocs and i <= len(blocs) else None)
             if d is not None and d.attrs.get("numero_trouve"):
                 d["Page"] = i
                 res.append(d)
@@ -948,23 +1043,25 @@ def _lire_pages(pages, type_, nom):
             df = pd.concat(res, ignore_index=True)
             df.attrs["anomalies"] = [a for d in res for a in d.attrs["anomalies"]]
             return df
-    return lire_texte("\n".join(pages), type_, nom)
+    return lire_texte("\n".join(pages), type_, nom, blocs[0] if blocs else None)
 
 def lire_pdf(fichier, type_="vente"):
     """Cascade : XML intégré -> texte du PDF (3 extractions) -> OCR (si installé) -> IA (si clé API)."""
     ext = os.path.splitext(fichier)[1].lower()
     nom = os.path.splitext(os.path.basename(fichier))[0]
     variantes = []
+    blocs = []
     if ext == ".pdf":
         df = lire_facturx(fichier, type_)
         if df is not None: return df
         variantes = textes_pdf(fichier)
+        blocs = _blocs_haut(fichier) if type_ == "vente" else []
     if not any(len("".join(v).strip()) >= 40 for v in variantes):
         t = ocr_texte(fichier)
         variantes = [[t]] if t else []
     best = None
     for pages in variantes:
-        cand = _lire_pages(pages, type_, nom)
+        cand = _lire_pages(pages, type_, nom, blocs)
         if cand is not None and (best is None or len(cand.attrs["anomalies"]) < len(best.attrs["anomalies"])):
             best = cand
             if not cand.attrs["anomalies"]: break
@@ -1914,6 +2011,13 @@ def _traiter(fichiers, type_="vente", siren="000000000", exercice="", sortie="."
     if anomalies:
         rapport = os.path.join(sortie, "rapport_anomalies.csv")
         pd.DataFrame(anomalies, columns=["ligne_source", "anomalie", "detail"]).to_csv(rapport, index=False, sep=";")
+    docs_lus = [f for f in factures if f["fichier"].lower().endswith((".pdf", ".png", ".jpg", ".jpeg", ".xml"))]
+    if type_ == "vente" and len({f["fichier"] for f in docs_lus}) >= 3:          # même « client » sur tout le lot ?
+        from collections import Counter
+        nom_, nb_ = Counter(norm(f["tiers"]) for f in docs_lus).most_common(1)[0]
+        if nom_ and nom_ != "a identifier" and nb_ == len(docs_lus):
+            anomalies.append(("Dossier", f"Le même client « {docs_lus[0]['tiers']} » sur toutes les factures PDF : "
+                                         "vérifiez que ce n'est pas votre propre société (émetteur)", ""))
     sans = sorted({a[2] for a in anomalies if a[1].startswith("Aucune règle d'imputation")})
     return dict(sources=sources, multi_taux=multi, rapprochements=rapp, factures=factures, fec=fec, zip=archive, ecritures=ecr, anomalies=anomalies, rapport=rapport, total=total, sans_regle=sans)
 
