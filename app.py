@@ -4,18 +4,29 @@ import pandas as pd
 import streamlit as st
 import agent_fec as ag
 
-st.set_page_config(page_title="Agent Fec", page_icon="🧾")
-# Barre d'onglets tout en haut et toujours visible (collée sous l'en-tête de Streamlit pendant le défilement)
+st.set_page_config(page_title="Agent Fec", page_icon="🧾", layout="wide")
 st.markdown("""<style>
+/* En-tête Streamlit compact */
 header[data-testid="stHeader"] {height: 2.5rem; min-height: 2.5rem;}
-.block-container {padding-top: 3rem;}
-.stTabs [data-baseweb="tab-list"] {
-    position: sticky; top: 2.5rem; z-index: 999; background-color: #ffffff;
-    padding: 0.25rem 0; border-bottom: 1px solid rgba(128,128,128,0.25); overflow-x: auto;
+.block-container, [data-testid="stMainBlockContainer"] {padding-top: 5.4rem !important; max-width: 1600px;}
+/* Barre d'onglets FIXE en haut de l'écran : reste visible quel que soit le défilement */
+.stTabs [data-baseweb="tab-list"], [data-testid="stTabs"] [role="tablist"] {
+    position: fixed !important; top: 2.7rem; left: 50%; transform: translateX(-50%); z-index: 999990;
+    width: max-content; max-width: 96vw; overflow-x: auto; gap: 0.2rem;
+    padding: 0.15rem 0.6rem; border: 1px solid rgba(128,128,128,0.3); border-radius: 0.8rem;
+    background: rgba(255,255,255,0.96); box-shadow: 0 2px 10px rgba(0,0,0,0.10);
 }
-.stTabs [data-baseweb="tab"] {font-size: 1rem; padding: 0.4rem 0.8rem;}
-@media (prefers-color-scheme: dark) { .stTabs [data-baseweb="tab-list"] {background-color: #0e1117;} }
-[data-testid="stAppViewContainer"][data-theme="dark"] .stTabs [data-baseweb="tab-list"] {background-color: #0e1117;}
+.stTabs [data-baseweb="tab-border"] {display: none;}
+.stTabs [data-baseweb="tab"] {font-size: 1rem; padding: 0.35rem 0.9rem;}
+@media (prefers-color-scheme: dark) {
+    .stTabs [data-baseweb="tab-list"], [data-testid="stTabs"] [role="tablist"] {background: rgba(14,17,23,0.96);}
+}
+/* Sur ordinateur : l'aperçu de la facture reste visible à droite pendant le défilement du tableau */
+@media (min-width: 900px) {
+    div[data-testid="stColumn"]:has(.apercu-facture), div[data-testid="column"]:has(.apercu-facture) {
+        position: sticky; top: 5.4rem; align-self: flex-start; max-height: calc(100vh - 6rem); overflow-y: auto;
+    }
+}
 </style>""", unsafe_allow_html=True)
 ss = st.session_state
 
@@ -441,38 +452,44 @@ with tab1:
             st.caption(f"🟡 {nb_al} écriture(s) en alerte (surlignées en jaune) : voir la colonne « alerte ».")
         if nb_vert:
             st.caption(f"🟢 {nb_vert} écriture(s) hors dates d'exercice mais traitées (vert pâle) : voir la colonne « remarque ».")
-        st.caption("Touchez une ligne pour afficher la facture correspondante.")
-        vue = ecr[["num", "date", "date_piece", "compte", "aux", "piece", "lib", "debit", "credit", "alerte", "note"]].copy()
-        if nb_al and st.checkbox("Afficher uniquement les écritures en alerte", key="seul_alertes"):
-            vue = vue[vue["num"].isin(set(ecr.loc[ecr["alerte"] != "", "num"]))]
-        vue["date"] = pd.to_datetime(vue["date"]).dt.strftime("%d/%m/%Y")
-        vue["date_piece"] = pd.to_datetime(vue["date_piece"]).dt.strftime("%d/%m/%Y")
-        vue = vue.rename(columns={"date_piece": "date pièce", "note": "remarque"})
-        for k in ("debit", "credit"):
-            vue[k] = vue[k].astype(float)
-        jaune = vue["alerte"] != ""
-        # une alerte colore toutes les lignes de l'écriture concernée
-        nums_al = set(vue.loc[jaune, "num"])
-        nums_vert = set(vue.loc[vue["remarque"] != "", "num"]) - nums_al     # jaune prioritaire sur vert
-        def _jaune(row):
-            if row["num"] in nums_al: return ["background-color: #FFF9C4; color: #000"] * len(row)
-            if row["num"] in nums_vert: return ["background-color: #E8F5E9; color: #000"] * len(row)
-            return [""] * len(row)
-        sel = None
-        try:
-            ev = st.dataframe(vue.style.apply(_jaune, axis=1).format({"debit": "{:.2f}", "credit": "{:.2f}"}),
-                              on_select="rerun", selection_mode="single-row", hide_index=True,
-                              use_container_width=True, key="tbl_ecr")
-            if ev.selection.rows and ev.selection.rows[0] < len(vue):
-                sel = ecr.loc[vue.index[ev.selection.rows[0]]]
-        except Exception:                                   # anciennes versions de Streamlit
-            st.dataframe(vue.style.apply(_jaune, axis=1), hide_index=True, use_container_width=True)
-            uniques = ecr.drop_duplicates("num")
-            choix = st.selectbox("Facture à afficher", ["(aucune)"] + [f"{p.num} - {p.piece}" for p in uniques.itertuples()])
-            if choix != "(aucune)":
-                sel = uniques[uniques["num"] == int(choix.split(" - ")[0])].iloc[0]
-        if sel is not None:
-            afficher_piece(sel)
+        col_ecr, col_apercu = st.columns([3, 2], gap="medium")   # ordinateur : tableau à gauche, facture à droite
+        with col_ecr:
+            st.caption("Touchez une ligne pour afficher la facture correspondante.")
+            vue = ecr[["num", "date", "date_piece", "compte", "aux", "piece", "lib", "debit", "credit", "alerte", "note"]].copy()
+            if nb_al and st.checkbox("Afficher uniquement les écritures en alerte", key="seul_alertes"):
+                vue = vue[vue["num"].isin(set(ecr.loc[ecr["alerte"] != "", "num"]))]
+            vue["date"] = pd.to_datetime(vue["date"]).dt.strftime("%d/%m/%Y")
+            vue["date_piece"] = pd.to_datetime(vue["date_piece"]).dt.strftime("%d/%m/%Y")
+            vue = vue.rename(columns={"date_piece": "date pièce", "note": "remarque"})
+            for k in ("debit", "credit"):
+                vue[k] = vue[k].astype(float)
+            jaune = vue["alerte"] != ""
+            # une alerte colore toutes les lignes de l'écriture concernée
+            nums_al = set(vue.loc[jaune, "num"])
+            nums_vert = set(vue.loc[vue["remarque"] != "", "num"]) - nums_al     # jaune prioritaire sur vert
+            def _jaune(row):
+                if row["num"] in nums_al: return ["background-color: #FFF9C4; color: #000"] * len(row)
+                if row["num"] in nums_vert: return ["background-color: #E8F5E9; color: #000"] * len(row)
+                return [""] * len(row)
+            sel = None
+            try:
+                ev = st.dataframe(vue.style.apply(_jaune, axis=1).format({"debit": "{:.2f}", "credit": "{:.2f}"}),
+                                  on_select="rerun", selection_mode="single-row", hide_index=True,
+                                  use_container_width=True, key="tbl_ecr")
+                if ev.selection.rows and ev.selection.rows[0] < len(vue):
+                    sel = ecr.loc[vue.index[ev.selection.rows[0]]]
+            except Exception:                                   # anciennes versions de Streamlit
+                st.dataframe(vue.style.apply(_jaune, axis=1), hide_index=True, use_container_width=True)
+                uniques = ecr.drop_duplicates("num")
+                choix = st.selectbox("Facture à afficher", ["(aucune)"] + [f"{p.num} - {p.piece}" for p in uniques.itertuples()])
+                if choix != "(aucune)":
+                    sel = uniques[uniques["num"] == int(choix.split(" - ")[0])].iloc[0]
+        with col_apercu:
+            st.markdown('<div class="apercu-facture"></div>', unsafe_allow_html=True)
+            if sel is not None:
+                afficher_piece(sel)
+            else:
+                st.info("👈 Touchez une ligne du tableau pour afficher ici la facture correspondante.")
 
         with st.expander("✏️ Modifier les écritures", expanded=False):
             st.caption("Modifiez comptes, libellés, montants ou dates ; ajoutez une ligne (+) en indiquant le n° d'écriture. "
