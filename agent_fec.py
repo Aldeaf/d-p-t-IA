@@ -12,7 +12,7 @@ PDF/images : Factur-X (XML intégré) -> texte du PDF (règles) -> OCR PaddleOCR
 -> IA Claude (facultatif, payant, si ANTHROPIC_API_KEY est défini).
 """
 import argparse, hashlib, io, json, os, re, shutil, sys, tempfile, unicodedata, zipfile
-VERSION = "2026.11.06-x"
+VERSION = "2026.11.06-y"
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from decimal import Decimal, ROUND_HALF_UP
@@ -917,6 +917,25 @@ TITRE_LIANTS = {"de", "du", "des", "la", "le", "les", "d", "l", "n", "no", "nr",
                 "service", "services", "prestation", "prestations", "travaux", "frais", "a", "au", "aux", "en", "sur", "pour",
                 "periode", "ref", "reference", "date"}
 
+VOCAB_FACTURE = {"echeance", "echeances", "payer", "regler", "reglement", "reglements", "paiement", "paiements", "modalites",
+                 "penalites", "penalite", "escompte", "remise", "remises", "domiciliation", "signature", "cachet", "merci",
+                 "observations", "observation", "commentaires", "commentaire", "notes", "note", "base", "taux", "libelle", "unite",
+                 "commande", "references", "reference", "conditions", "condition", "total", "totaux", "montant", "montants", "date",
+                 "numero", "mode", "virement", "cheque", "especes", "carte", "prelevement", "reception", "delai", "jours", "net",
+                 "reste", "somme", "due", "du", "recapitulatif", "detail", "designation", "quantite", "qte", "prix", "unitaire",
+                 "tva", "ht", "ttc", "page", "sur", "accord", "bon", "pour", "valable", "validite", "devis", "facture", "avoir",
+                 "votre", "vos", "notre", "nos", "objet", "periode", "intervention", "livraison", "expedition", "transport",
+                 "frais", "port", "emballage", "acompte", "solde", "versement", "iban", "bic", "banque", "titulaire", "compte",
+                 "coordonnees", "bancaires", "rib", "a", "au", "aux", "de", "des", "le", "la", "les", "l", "d", "en", "et", "ou",
+                 "par", "le", "jour", "mois", "an", "fois", "legal", "taux", "retard", "indemnite", "forfaitaire", "recouvrement",
+                 "client", "clients", "cliente", "conseiller", "commercial", "contact", "interlocuteur", "dossier", "affaire"}
+VOCAB_DEBUT = {"echeance", "echeances", "payer", "reglement", "paiement", "modalites", "penalites", "escompte", "remise",
+               "domiciliation", "signature", "cachet", "merci", "observations", "commentaires", "notes", "base", "taux",
+               "libelle", "unite", "conditions", "total", "montant", "mode", "virement", "cheque", "especes", "prelevement",
+               "delai", "net", "reste", "somme", "recapitulatif", "designation", "quantite", "prix", "valable", "validite",
+               "periode", "frais", "acompte", "solde", "versement", "banque", "rib", "indemnite", "le", "du", "date", "a",
+               "objet", "intervention", "conseiller", "interlocuteur", "votre", "vos", "page"}
+
 MOTS_LIBELLE = {"titulaire", "contrat", "souscripteur", "abonne", "abonnee", "ligne", "ou", "et", "client", "cliente", "clients", "clientes", "e", "informations", "information", "infos", "info", "coordonnees",
                 "nom", "adresse", "du", "de", "la", "le", "l", "d", "votre", "vos", "notre", "destinataire", "facturation",
                 "livraison", "acheteur", "acheteuse", "identite", "doit", "a", "facture", "factures", "adressee", "adresse",
@@ -933,6 +952,11 @@ def _nom_valide(s):
     if _est_titre(s) or re.match(NON_NOM, s, re.I) or re.match(r"^\d{5}\b", s): return False
     if norm(s) and all(t in FORMES or t in FORMES_DEBUT for t in norm(s).split()): return False   # « SAS » seul
     if norm(s) and all(t in MOTS_LIBELLE for t in norm(s).split()): return False     # « Cliente », « Informations client »
+    jn = norm(s).split()
+    if jn and (jn[0] in VOCAB_DEBUT or jn[0] in TITRE_MOTS - {"note", "bon"} and len(jn) > 1 and not _est_titre(s)
+               or all(t in VOCAB_FACTURE or t in MOTS_LIBELLE or t in TITRE_MOTS for t in jn)): return False   # « Échéance », « À payer »
+    if re.match(NON_NOM, norm(s)): return False                                       # mêmes exclusions, sans les accents
+    if D_ALL.search(s) or re.search(r"@|www\.|https?:|#\s*\S*\d", s, re.I): return False  # date, site web, e-mail, « # 123 »
     if re.search(r"\d[\d  ]*[.,]\d{2}\b", s): return False                          # contient un montant (ligne de total, d'article)
     if re.search(r"\bn[°º]\s*:?\s*\S*\d|^(?:pi[èe]ce|r[ée]f\.?|r[ée]f[ée]rence|bon|ticket|re[çc]u)\b", s, re.I): return False
     if re.match(r"(?:net|reste|solde|sous[\s-]?total|subtotal|amount|balance|au\s+capital|capital|acompte|r[ée]gl[ée]|pay[ée]|"
@@ -957,6 +981,8 @@ def _nettoyer_nom0(s):
     if _est_titre(s): return ""                                   # le titre du document n'est pas un tiers
     s = re.sub(r"^(?:facture|avoir|invoice)\s+", "", s, flags=re.I)   # "Facture Dupont SARL" (titre collé au nom)
     s = re.split(r"\s{2,}|\s+(?:date|n[°º]|num[ée]ro|r[ée]f|page|t[ée]l|email|e-mail|siret|siren|tva)\b", s, 1, flags=re.I)[0].strip(" :-|")
+    s = re.split(r"\s+(?=(?:facture|invoice|avoir|devis)\s*(?:n[°ºo]|num|#|:|\d))", s, 1, flags=re.I)[0].strip(" :-|")   # « Studio X Facture n° 12 »
+    s = re.split(rf"\s+(?=(?:{CLIENT_LAB}|destinataire|factur[ée]e?\s*[àa]|doit)\s*:)", s, 1, flags=re.I)[0].strip(" :-|")    # « X Nom du client : Y »
     m_civ = re.search(r"(?<=\w)\s+(?=(?:M\.|Mme|Mlle|Mr\.?|Monsieur|Madame)\s+[A-ZÀ-Ý&])", s)          # 2 colonnes fusionnées
     if m_civ and re.search(r"[A-Za-zÀ-ÿ]{3,}", re.sub(r"\b(?:M\.?|Mme|Mlle|Mr|Monsieur|Madame|et)\b|&", "", s[:m_civ.start()])):
         s = s[:m_civ.start()].strip(" :-|")
@@ -1087,14 +1113,18 @@ def _client_par_position(blocs, preuves, lignes):
     elif premier and any(_meme_societe(premier, _nettoyer_nom(x)) for x in d[:3]): ordre = [g]   # en-tête à droite
     for b in ordre:
         c = _nom_du_bloc(b, preuves)
-        if c and not (premier and _meme_societe(c, premier)): return c
+        jp = {t for t in norm(premier).split() if len(t) >= 3 and t not in FORMES}
+        jc = {t for t in norm(c).split() if len(t) >= 3 and t not in FORMES}
+        if c and not (jp and jp <= jc): return c                   # le client n'est pas le nom de l'en-tête
     return ""
 
 ENTETE_CHAMPS = {"numero": r"n[°º]\s*(?:de\s*)?(?:facture|pi[èe]ce|document)|num[ée]ro(?:\s*de\s*facture)?|facture\s*n[°º]|"
                             r"invoice\s*(?:no|number|#)|r[ée]f[ée]rence|r[ée]f\.?",
                  "date": r"date(?:\s*(?:de\s*(?:la\s*)?)?facture)?|date\s*d['’]\s*[ée]mission|invoice\s*date",
                  "tiers": CLIENT_LAB + r"|destinataire|customer",
-                 "autre": r"[ée]ch[ée]ance|date\s*d['’]\s*[ée]ch[ée]ance|mode\s*de\s*(?:paiement|r[èe]glement)|commercial|vendeur|"
+                 "autre": r"date\s*d['’]\s*[ée]ch[ée]ance|[ée]ch[ée]ance|mode\s*de\s*(?:paiement|r[èe]glement)|commercial|vendeur|"
+                          r"total\s*(?:[àa]\s*payer|ttc|ht|t\.t\.c\.)?|montant(?:\s*(?:ttc|ht|[àa]\s*payer))?|net\s*[àa]\s*payer|[àa]\s*payer|"
+                          r"reste\s*[àa]\s*payer|r[èe]glement|conditions(?:\s*de\s*paiement)?|d[ée]lai(?:\s*de\s*paiement)?|"
                           r"page|devise|conditions|code\s*client|n[°º]\s*client|r[ée]f\.?\s*client|bon\s*de\s*commande|n[°º]\s*commande"}
 
 def _entete_tableau(lignes):
@@ -1109,8 +1139,9 @@ def _entete_tableau(lignes):
             if l[pos:].strip(" |;-") or len(ordre) < 2 or not ({"numero", "tiers"} & set(ordre)) or i + 1 >= len(lignes): continue
             v = lignes[i + 1]
             out = {}
-            md = D_ALL.search(v)
-            if "date" in ordre and md: out["date"] = _conv_date(md.group(0)); v = v[:md.start()] + "  " + v[md.end():]
+            dates = list(D_ALL.finditer(v))
+            if "date" in ordre and dates: out["date"] = _conv_date(dates[0].group(0))
+            v = D_ALL.sub("  ", v)                                         # toutes les dates retirées avant de chercher n° et nom
             if "numero" in ordre:
                 mn = re.search(r"(?<!\S)([A-Z]{0,6}[\-/_.]?\d[\w\-/_.]{1,20})(?!\S)", v, re.I)
                 if mn: out["numero"] = mn.group(1).strip(".-/_"); v = v[:mn.start()] + "  " + v[mn.end():]
@@ -1124,9 +1155,6 @@ def _entete_tableau(lignes):
 def _tiers_texte(lignes, type_, blocs=None):
     preuves = _preuves_emetteur(lignes)
     em = preuves["noms"][0] if preuves["noms"] else ""
-    if type_ == "vente":                                            # 0. en-tête en tableau (N° facture | Date | Client)
-        c = _nettoyer_nom(_entete_tableau(lignes).get("tiers", ""))
-        if c and _nom_valide(c) and not _est_emetteur(c, preuves): return c
     pas_emetteur = (lambda c: not _est_emetteur(c, preuves)) if type_ == "vente" else (lambda c: True)
     for i, l in enumerate(lignes):                                  # 1. libellé explicite
         m = re.match(rf"\s*{ETIQ[type_]}(?![a-zà-ÿ0-9])\s*:?\s*(.*)$", l, re.I)
@@ -1139,6 +1167,9 @@ def _tiers_texte(lignes, type_, blocs=None):
                 if em and norm(cand).startswith(norm(em)[:max(4, len(norm(em)) - 2)]):
                     reste = _nettoyer_nom(cand[len(em):])
                     if reste and _nom_valide(reste) and pas_emetteur(reste): return reste
+    if type_ == "vente":                                            # 1b. en-tête en tableau (Client | N° facture | Date…)
+        c = _nettoyer_nom(_entete_tableau(lignes).get("tiers", ""))
+        if c and _nom_valide(c) and not _est_emetteur(c, preuves): return c
     if type_ == "achat":
         if em: return em
         skip = 0                                                    # 3. sinon 1re ligne hors bloc client
@@ -1225,7 +1256,7 @@ def lire_texte(texte, type_, nom, blocs=None):
     tiers = _tiers_texte(lignes, type_, blocs)
     if not tiers:
         tiers = "A IDENTIFIER"; anom.append(("Tiers non identifié", numero))
-    d = tab.get("date") or _date_texte(t)
+    d = _date_texte(t) or tab.get("date")
     ids = ";".join(identifiants(texte, type_))
     df = pd.DataFrame([{"Date facture": d, "N° facture": numero, "Client": tiers, "Total HT": str(sg * b),
                         "Taux TVA": taux_str(r), "Total TVA": str(sg * v), "Total TTC": str(sg * (b + v)), "Ids": ids}
