@@ -12,7 +12,7 @@ PDF/images : Factur-X (XML intégré) -> texte du PDF (règles) -> OCR PaddleOCR
 -> IA Claude (facultatif, payant, si ANTHROPIC_API_KEY est défini).
 """
 import argparse, hashlib, io, json, os, re, shutil, sys, tempfile, unicodedata, zipfile
-VERSION = "2026.11.06-w"
+VERSION = "2026.11.06-x"
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from decimal import Decimal, ROUND_HALF_UP
@@ -462,8 +462,11 @@ MOIS = {"janvier": 1, "janv": 1, "jan": 1, "fevrier": 2, "fevr": 2, "fev": 2, "m
 NB = r"(-?(?:\d{1,3}(?:[ .,]\d{3})+|\d+)(?:[.,]\d{1,2})?)(?![\d]|[.,]\d|\s*%)"
 TOKEN = r"([A-Z0-9][A-Z0-9\-/_.]*\d[A-Z0-9\-/_.]*)"
 D_NUM = r"(?<![\d/.\-])(?:\d{4}-\d{2}-\d{2}|\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4})(?!\d)"
-D_FR = r"\d{1,2}(?:er)?\s+[A-Za-zÀ-ÿ]{3,9}\.?,?\s+\d{4}"
-D_EN = r"[A-Za-zÀ-ÿ]{3,9}\.?\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}"
+_MOIS_RE = (r"(?:janv(?:ier)?|f[ée]v(?:r(?:ier)?)?|mars?|avr(?:il)?|mai|juin|juil(?:let)?|ao[uû]t?|sept?(?:embre)?|oct(?:obre)?|"
+            r"nov(?:embre)?|d[ée]c(?:embre)?|jan(?:uary)?|feb(?:ruary)?|march|apr(?:il)?|may|june?|july?|aug(?:ust)?|"
+            r"september|october|november|dec(?:ember)?)")
+D_FR = r"\d{1,2}(?:er)?[ \t]+" + _MOIS_RE + r"\.?,?[ \t]+\d{4}"
+D_EN = _MOIS_RE + r"\.?[ \t]+\d{1,2}(?:st|nd|rd|th)?,?[ \t]+\d{4}"
 D_ALL = re.compile("(" + D_NUM + ")|(" + D_FR + ")|(" + D_EN + ")", re.I)
 
 # ----- XML : Factur-X / ZUGFeRD (CII) et UBL -----
@@ -862,8 +865,10 @@ def _numero(texte):
         for r in re.finditer(pat + TOKEN, t, re.I):
             c = r.group(1).strip(".-/_,")
             if c and k <= 1 and re.fullmatch(r"\d{2}-\d{2}-\d{2,4}", c): return c   # « Facture N° 26-10-50 » : n° au format date
-            if not c or re.fullmatch(D_NUM, c) or re.fullmatch(r"(?:19|20)\d{2}", c) or re.fullmatch(r"\d{9}|\d{14}", c): continue
-            if len(c) < (1 if explicite else 4): continue
+            if not c or re.fullmatch(D_NUM, c) or (re.fullmatch(r"(?:19|20)\d{2}", c) and k > 1) or re.fullmatch(r"\d{9}|\d{14}", c): continue
+            seul = re.fullmatch(r"\s*(?:facture|avoir|invoice)\s*:?\s*" + re.escape(r.group(1)) + r"\s*",
+                                t[t.rfind("\n", 0, r.start(1)) + 1:(t.find("\n", r.end(1)) if t.find("\n", r.end(1)) >= 0 else len(t))], re.I)
+            if len(c) < (1 if explicite or seul else 4): continue           # « Facture 132 » seul sur sa ligne : accepté
             if PLAQUE.match(c) or re.sub(r"[^A-Z0-9]", "", c.upper()) in plaques: continue          # immatriculation
             if c.isdigit() and len(c) <= 4 and re.match(r"[\s-]*[A-Z]{2,3}[\s-]*\d{2,3}\b", t[r.end(1):r.end(1) + 8]): continue   # 1234 AB 56
             ls_, le_ = t.rfind("\n", 0, r.start(1)) + 1, t.find("\n", r.end(1))
@@ -882,7 +887,8 @@ CLIENT_LAB = (r"(?:(?:informations?|infos?|coordonn[ée]es|nom|adresse|identit[�
               r"client(?:\s*\(\s*e\s*\)|e|s|·e|\.e)?(?:\s*(?:ou|et|/|-|–)\s*client(?:e|s)?)?(?![a-zà-ÿ])")   # « Client ou cliente »
 ETIQ = {"vente": r"(?:factur[ée]e?\s*[àa]|adresse\s*de\s*facturation|[àa]\s*l'attention\s*de|[àa]\s*destination\s*de|"
                  r"destinataire|" + CLIENT_LAB + r"|customer|bill(?:ed)?\s*to|sold\s*to|adress[ée]e?\s*[àa]|doit|acheteu(?:r|se)|"
-                 r"acqu[ée]reu(?:r|se)|donneur\s*d['’]\s*ordre|ma[îi]tre\s*d['’]\s*ouvrage|patient(?:e)?)",
+                 r"acqu[ée]reu(?:r|se)|donneur\s*d['’]\s*ordre|ma[îi]tre\s*d['’]\s*ouvrage|patient(?:e)?|titulaire\s*du\s*contrat|"
+                 r"titulaire\s*de\s*la\s*ligne|souscripteur|abonn[ée]e?|assur[ée]e?|adh[ée]rent(?:e)?|locataire|[ée]l[èe]ve)",
         "achat": r"(?:fournisseur|[ée]metteur|vendeur|vendu\s*par|prestataire|envoy[ée]e?\s*par|from|seller|supplier)"}
 NON_NOM = (r"^(?:factur\w*|avoir|invoice|devis|date|num[ée]ro|n[°º]|total|page|adresse|adress[ée]\w*|siret|siren|tva|iban|bic|"
            r"t[ée]l|email|e-mail|r[ée]f|code|france|paiement|conditions|mode|ech[ée]ance|objet|d[ée]signation|"
@@ -902,7 +908,7 @@ VEHICULE_MOTS = (r"immatricul|plaque|v[ée]hicule|marque|mod[èe]le|kilom|\bkm\b
 SEP_LEGAL = (r"\s*[|·•]\s*|\s+[-–—]\s+|,\s|\s+(?:au\s+)?capital|\s+siret|\s+siren|\s+rcs|\s+n[°º]|\s+tva|\s+ape\b|"
              r"\s+naf\b|\s+immatricul|\s+soci[ée]t[ée]\s+[àa]")
 
-TITRE_MOTS = {"facture", "factures", "avoir", "invoice", "devis", "proforma", "pro", "forma", "acompte", "acomptes", "situation",
+TITRE_MOTS = {"acquittee", "acquitte", "payee", "reglee", "soldee", "originale", "simplifiee", "facture", "factures", "avoir", "invoice", "devis", "proforma", "pro", "forma", "acompte", "acomptes", "situation",
               "recapitulatif", "releve", "decompte", "honoraires", "honoraire", "note", "bon", "recu", "quittance", "ticket",
               "commande", "duplicata", "original", "copie", "reglement", "document", "piece", "detail", "detaillee", "definitive",
               "provisoire", "rectificative", "complementaire", "finale", "intermediaire", "mensuelle", "trimestrielle",
@@ -911,7 +917,7 @@ TITRE_LIANTS = {"de", "du", "des", "la", "le", "les", "d", "l", "n", "no", "nr",
                 "service", "services", "prestation", "prestations", "travaux", "frais", "a", "au", "aux", "en", "sur", "pour",
                 "periode", "ref", "reference", "date"}
 
-MOTS_LIBELLE = {"ou", "et", "client", "cliente", "clients", "clientes", "e", "informations", "information", "infos", "info", "coordonnees",
+MOTS_LIBELLE = {"titulaire", "contrat", "souscripteur", "abonne", "abonnee", "ligne", "ou", "et", "client", "cliente", "clients", "clientes", "e", "informations", "information", "infos", "info", "coordonnees",
                 "nom", "adresse", "du", "de", "la", "le", "l", "d", "votre", "vos", "notre", "destinataire", "facturation",
                 "livraison", "acheteur", "acheteuse", "identite", "doit", "a", "facture", "factures", "adressee", "adresse",
                 "attention", "destination", "particulier", "professionnel", "societe", "contact", "patient", "patiente"}
@@ -927,6 +933,10 @@ def _nom_valide(s):
     if _est_titre(s) or re.match(NON_NOM, s, re.I) or re.match(r"^\d{5}\b", s): return False
     if norm(s) and all(t in FORMES or t in FORMES_DEBUT for t in norm(s).split()): return False   # « SAS » seul
     if norm(s) and all(t in MOTS_LIBELLE for t in norm(s).split()): return False     # « Cliente », « Informations client »
+    if re.search(r"\d[\d  ]*[.,]\d{2}\b", s): return False                          # contient un montant (ligne de total, d'article)
+    if re.search(r"\bn[°º]\s*:?\s*\S*\d|^(?:pi[èe]ce|r[ée]f\.?|r[ée]f[ée]rence|bon|ticket|re[çc]u)\b", s, re.I): return False
+    if re.match(r"(?:net|reste|solde|sous[\s-]?total|subtotal|amount|balance|au\s+capital|capital|acompte|r[ée]gl[ée]|pay[ée]|"
+                r"titulaire|souscripteur|chantier|lieu|livraison|exp[ée]di)\b", s, re.I): return False
     if re.search(VEHICULE_MOTS, s, re.I) or re.search(r"\b[A-Z]{2}[-\s]?\d{3}[-\s]?[A-Z]{2}\b", s): return False   # véhicule / plaque
     if re.match(LABELS_EMETTEUR + r"\s*:?\s*$", s, re.I) or re.match(rf"\s*{LABELS_ACHETEUR}\s*:?\s*$", s, re.I): return False
     if re.match(r"(?:capital|rcs|r\.c\.s|code\s*naf|naf|ape|n[°º]\s*tva|tva\s*intra|siret|siren|iban|bic)\b", s, re.I): return False
@@ -937,7 +947,9 @@ def _nom_valide(s):
     return True
 
 def _nettoyer_nom(s):
-    s = re.sub(rf"^\s*(?:{CLIENT_LAB}|doit\b|destinataire\b)\s*[:\-–]?\s*(?=\S)", "", str(s), count=1, flags=re.I)
+    s = re.sub(rf"^\s*(?:{CLIENT_LAB}|doit\b|destinataire\b|titulaire\s*du\s*contrat\b|titulaire\s*de\s*la\s*ligne\b|"
+               rf"souscripteur\b|abonn[ée]e?\b|ma[îi]tre\s*d['’]\s*ouvrage\b|factur[ée]e?\s*[àa]\b|bill\s*to\b)\s*[:\-–]?\s*(?=\S)",
+               "", str(s), count=1, flags=re.I)
     return _nettoyer_nom0(s)
 
 def _nettoyer_nom0(s):
@@ -945,7 +957,9 @@ def _nettoyer_nom0(s):
     if _est_titre(s): return ""                                   # le titre du document n'est pas un tiers
     s = re.sub(r"^(?:facture|avoir|invoice)\s+", "", s, flags=re.I)   # "Facture Dupont SARL" (titre collé au nom)
     s = re.split(r"\s{2,}|\s+(?:date|n[°º]|num[ée]ro|r[ée]f|page|t[ée]l|email|e-mail|siret|siren|tva)\b", s, 1, flags=re.I)[0].strip(" :-|")
-    s = re.split(r"(?<=\w)\s+(?=(?:M\.|Mme|Mlle|Mr\.?|Monsieur|Madame)\s+[A-ZÀ-Ý&])", s, 1)[0].strip(" :-|")   # 2 colonnes fusionnées
+    m_civ = re.search(r"(?<=\w)\s+(?=(?:M\.|Mme|Mlle|Mr\.?|Monsieur|Madame)\s+[A-ZÀ-Ý&])", s)          # 2 colonnes fusionnées
+    if m_civ and re.search(r"[A-Za-zÀ-ÿ]{3,}", re.sub(r"\b(?:M\.?|Mme|Mlle|Mr|Monsieur|Madame|et)\b|&", "", s[:m_civ.start()])):
+        s = s[:m_civ.start()].strip(" :-|")
     return "" if _est_titre(s) else s
 
 FORMES = {"sarl", "sas", "sasu", "eurl", "sa", "sci", "snc", "scop", "selarl", "earl", "gaec", "ets", "etablissements",
@@ -993,7 +1007,7 @@ def _preuves_emetteur(lignes):
         if legal:
             for x in lignes[max(0, i - 3):i + 4]:
                 for d in re.findall(r"@([a-z0-9\-]+)\.", x, re.I): domaines.add(d.replace("-", "").lower())
-        m = re.search(r"titulaire(?:\s*du\s*compte)?\s*:?\s*(.+)$", l, re.I)
+        m = re.search(r"titulaire\s*du\s*compte\s*:?\s*(.+)$", l, re.I)
         if m:
             c = _nettoyer_nom(m.group(1))
             if c and _nom_valide(c): noms.append(c)
@@ -1045,7 +1059,7 @@ def _nom_du_bloc(bloc, preuves):
         if m: saute = False
         cand = m.group(1) if m else l
         if not m and (":" in cand or re.search(r"\d+[.,]\d{2}\b", cand)): continue        # « Libellé : valeur », montants
-        contact = re.search(r"\b\d{5}\b|@|www\.|t[ée]l|port\.|fax|\+33|\b0\d(?:[ .]?\d{2}){4}\b", cand, re.I)
+        contact = re.search(r"\b\d{5}\b|@|www\.|\bt[ée]l\b|\bport\.|\bfax\b|\+33|\b0\d(?:[ .]?\d{2}){4}\b", cand, re.I)
         if saute:
             if contact: saute = "fin"                      # adresse de l'émetteur terminée...
             elif saute == "fin":
@@ -1076,9 +1090,43 @@ def _client_par_position(blocs, preuves, lignes):
         if c and not (premier and _meme_societe(c, premier)): return c
     return ""
 
+ENTETE_CHAMPS = {"numero": r"n[°º]\s*(?:de\s*)?(?:facture|pi[èe]ce|document)|num[ée]ro(?:\s*de\s*facture)?|facture\s*n[°º]|"
+                            r"invoice\s*(?:no|number|#)|r[ée]f[ée]rence|r[ée]f\.?",
+                 "date": r"date(?:\s*(?:de\s*(?:la\s*)?)?facture)?|date\s*d['’]\s*[ée]mission|invoice\s*date",
+                 "tiers": CLIENT_LAB + r"|destinataire|customer",
+                 "autre": r"[ée]ch[ée]ance|date\s*d['’]\s*[ée]ch[ée]ance|mode\s*de\s*(?:paiement|r[èe]glement)|commercial|vendeur|"
+                          r"page|devise|conditions|code\s*client|n[°º]\s*client|r[ée]f\.?\s*client|bon\s*de\s*commande|n[°º]\s*commande"}
+
+def _entete_tableau(lignes):
+    """En-tête de facture présenté en tableau : une ligne de libellés (N° facture, Date, Client…) suivie des valeurs."""
+    alt = "|".join(f"(?P<{k}>{p})" for k, p in ENTETE_CHAMPS.items())
+    for i, l in enumerate(lignes[:40]):
+        reste, ordre, pos = l, [], 0
+        for m in re.finditer(rf"(?:{alt})\s*:?", l, re.I):
+            if l[pos:m.start()].strip(" |;-"): break                      # texte qui n'est pas un libellé : pas un en-tête
+            ordre.append(m.lastgroup); pos = m.end()
+        else:
+            if l[pos:].strip(" |;-") or len(ordre) < 2 or not ({"numero", "tiers"} & set(ordre)) or i + 1 >= len(lignes): continue
+            v = lignes[i + 1]
+            out = {}
+            md = D_ALL.search(v)
+            if "date" in ordre and md: out["date"] = _conv_date(md.group(0)); v = v[:md.start()] + "  " + v[md.end():]
+            if "numero" in ordre:
+                mn = re.search(r"(?<!\S)([A-Z]{0,6}[\-/_.]?\d[\w\-/_.]{1,20})(?!\S)", v, re.I)
+                if mn: out["numero"] = mn.group(1).strip(".-/_"); v = v[:mn.start()] + "  " + v[mn.end():]
+            if "tiers" in ordre:
+                v = re.sub(r"\b\d[\d  ]*[.,]\d{2}\b\s*€?|\b(?:[A-Z]{0,6}[\-/_.]?\d[\w\-/_.]*)\b", "  ", v)
+                parts = [x.strip(" |;-") for x in re.split(r"\s{2,}|\|", v) if re.search(r"[A-Za-zÀ-ÿ]{2}", x)]
+                if parts: out["tiers"] = max(parts, key=len)
+            return out
+    return {}
+
 def _tiers_texte(lignes, type_, blocs=None):
     preuves = _preuves_emetteur(lignes)
     em = preuves["noms"][0] if preuves["noms"] else ""
+    if type_ == "vente":                                            # 0. en-tête en tableau (N° facture | Date | Client)
+        c = _nettoyer_nom(_entete_tableau(lignes).get("tiers", ""))
+        if c and _nom_valide(c) and not _est_emetteur(c, preuves): return c
     pas_emetteur = (lambda c: not _est_emetteur(c, preuves)) if type_ == "vente" else (lambda c: True)
     for i, l in enumerate(lignes):                                  # 1. libellé explicite
         m = re.match(rf"\s*{ETIQ[type_]}(?![a-zà-ÿ0-9])\s*:?\s*(.*)$", l, re.I)
@@ -1124,6 +1172,8 @@ def lire_texte(texte, type_, nom, blocs=None):
     t = _norm_txt(texte)
     lignes = [l.strip() for l in t.splitlines() if l.strip()]
     anom, numero = [], _numero(t)
+    tab = _entete_tableau(lignes)                         # en-tête en tableau : N° facture | Date | Client
+    if not numero and tab.get("numero"): numero = tab["numero"]
     trouve = bool(numero)
     if not numero:
         numero = nom; anom.append(("N° de facture non trouvé (nom du fichier utilisé)", nom))
@@ -1175,7 +1225,7 @@ def lire_texte(texte, type_, nom, blocs=None):
     tiers = _tiers_texte(lignes, type_, blocs)
     if not tiers:
         tiers = "A IDENTIFIER"; anom.append(("Tiers non identifié", numero))
-    d = _date_texte(t)
+    d = tab.get("date") or _date_texte(t)
     ids = ";".join(identifiants(texte, type_))
     df = pd.DataFrame([{"Date facture": d, "N° facture": numero, "Client": tiers, "Total HT": str(sg * b),
                         "Taux TVA": taux_str(r), "Total TVA": str(sg * v), "Total TTC": str(sg * (b + v)), "Ids": ids}
