@@ -12,7 +12,7 @@ PDF/images : Factur-X (XML intégré) -> texte du PDF (règles) -> OCR PaddleOCR
 -> IA Claude (facultatif, payant, si ANTHROPIC_API_KEY est défini).
 """
 import argparse, hashlib, io, json, os, re, shutil, sys, tempfile, unicodedata, zipfile
-VERSION = "2026.11.06-v"
+VERSION = "2026.11.06-w"
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from decimal import Decimal, ROUND_HALF_UP
@@ -879,7 +879,7 @@ def _numero(texte):
 # ----- tiers -----
 # « Client », « Cliente », « Client(e) », « Clients », « Nom du client », « Informations cliente », « Coordonnées client »…
 CLIENT_LAB = (r"(?:(?:informations?|infos?|coordonn[ée]es|nom|adresse|identit[ée]|votre|notre)\s*(?:du\s*|de\s*la\s*|d['’]\s*|de\s*l['’]\s*)?)?"
-              r"client(?:\s*\(\s*e\s*\)|e|s|·e|\.e)?(?![a-zà-ÿ])")
+              r"client(?:\s*\(\s*e\s*\)|e|s|·e|\.e)?(?:\s*(?:ou|et|/|-|–)\s*client(?:e|s)?)?(?![a-zà-ÿ])")   # « Client ou cliente »
 ETIQ = {"vente": r"(?:factur[ée]e?\s*[àa]|adresse\s*de\s*facturation|[àa]\s*l'attention\s*de|[àa]\s*destination\s*de|"
                  r"destinataire|" + CLIENT_LAB + r"|customer|bill(?:ed)?\s*to|sold\s*to|adress[ée]e?\s*[àa]|doit|acheteu(?:r|se)|"
                  r"acqu[ée]reu(?:r|se)|donneur\s*d['’]\s*ordre|ma[îi]tre\s*d['’]\s*ouvrage|patient(?:e)?)",
@@ -911,7 +911,7 @@ TITRE_LIANTS = {"de", "du", "des", "la", "le", "les", "d", "l", "n", "no", "nr",
                 "service", "services", "prestation", "prestations", "travaux", "frais", "a", "au", "aux", "en", "sur", "pour",
                 "periode", "ref", "reference", "date"}
 
-MOTS_LIBELLE = {"client", "cliente", "clients", "clientes", "e", "informations", "information", "infos", "info", "coordonnees",
+MOTS_LIBELLE = {"ou", "et", "client", "cliente", "clients", "clientes", "e", "informations", "information", "infos", "info", "coordonnees",
                 "nom", "adresse", "du", "de", "la", "le", "l", "d", "votre", "vos", "notre", "destinataire", "facturation",
                 "livraison", "acheteur", "acheteuse", "identite", "doit", "a", "facture", "factures", "adressee", "adresse",
                 "attention", "destination", "particulier", "professionnel", "societe", "contact", "patient", "patiente"}
