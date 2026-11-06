@@ -12,11 +12,11 @@ PDF/images : Factur-X (XML intégré) -> texte du PDF (règles) -> OCR PaddleOCR
 -> IA Claude (facultatif, payant, si ANTHROPIC_API_KEY est défini).
 """
 import argparse, hashlib, io, json, os, re, shutil, sys, tempfile, unicodedata, zipfile
-VERSION = "2026.11.06-l"
+VERSION = "2026.11.06-n"
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from decimal import Decimal, ROUND_HALF_UP
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 
 # ---------- Paramétrage comptable (à adapter au dossier) ----------
@@ -595,6 +595,77 @@ def _ventiler(candidats, ht, tva_tot):
             return [(r, b, v) for r, (b, v) in g.items()]
     return None
 
+TAUX_CONNUS = [20.0, 10.0, 8.5, 5.5, 2.1, 1.05, 0.9, 13.0, 0.0]   # métropole + DOM + Corse
+
+def _mono_taux_ok(ht, tva):
+    """Vrai si la TVA totale correspond exactement à un seul taux appliqué au HT (à 5 centimes près)."""
+    return any(abs(abs(ht) * Decimal(str(r)) / 100 - abs(tva)) <= Decimal("0.05") for r in TAUX_CONNUS)
+
+def _ventiler_ancre(lignes, ht, tva):
+    """Secours multi-taux : avec les totaux HT/TVA et les taux présents sur la facture, retrouve la base de chaque taux.
+    La solution n'est retenue que si les bases calculées figurent en toutes lettres sur la pièce (pas de montant inventé)
+    et si elle est unique."""
+    ht, tva = abs(ht), abs(tva)
+    if not ht or not tva: return None
+    texte = "\n".join(lignes)
+    taux = []
+    for m in re.finditer(r"(?<![\d.,])(\d{1,2}(?:[.,]\d{1,2})?)\s*%", texte):
+        r = float(m.group(1).replace(",", "."))
+        if r in TAUX_CONNUS and r not in taux and not re.search(r"remise|escompte|p[ée]nalit|retard|acompte|commission|r[ée]duc",
+                                                                  texte[max(0, m.start() - 40):m.start()], re.I):
+            taux.append(r)
+    if len(taux) < 2: return None
+    montants = set()
+    for x in re.findall(NB, re.sub(r"\d{1,2}(?:[.,]\d{1,2})?\s*%", " ", texte)):
+        v = montant(x)
+        if v is not None and Decimal("0.01") <= abs(v) < ht + Decimal("0.01") and re.search(r"[.,]\d{2}$", x):
+            montants.add(abs(v))
+    par_taux = {}                                              # somme des montants des lignes d'un même taux
+    for l in lignes:
+        p = [float(m.group(1).replace(",", ".")) for m in re.finditer(r"(?<![\d.,])(\d{1,2}(?:[.,]\d{1,2})?)\s*%", l)]
+        if len(p) != 1 or p[0] not in taux: continue
+        v = [montant(x) for x in re.findall(NB, re.sub(r"\d{1,2}(?:[.,]\d{1,2})?\s*%", " ", l))]
+        v = [abs(x) for x in v if x is not None and re.search(r"[.,]\d", str(x))]
+        if v: par_taux.setdefault(p[0], []).append(v[-1])
+    for r, vs in par_taux.items():
+        if len(vs) > 1: montants.add(sum(vs))                   # lignes d'articles d'un même taux additionnées
+    montants = sorted(montants, reverse=True)[:120]
+    tol = Decimal("0.03")
+    def tv(b, r): return (b * Decimal(str(r)) / 100).quantize(Decimal("0.01"), ROUND_HALF_UP)
+    sols = {}
+    from itertools import permutations
+    for r1, r2 in permutations(taux, 2):                        # 2 taux : une base lue sur la pièce suffit
+        for a in montants:
+            for b1 in (a, (a / (1 + Decimal(str(r1)) / 100)).quantize(Decimal("0.01"), ROUND_HALF_UP)):   # a = HT ou TTC du taux r1
+                b2 = ht - b1
+                if b1 <= 0 or b2 <= 0: continue
+                v1 = tv(b1, r1); v2 = tva - v1
+                if abs(v2 - tv(b2, r2)) > tol: continue
+                appui = (b1 in montants) + (b2 in montants) + (v1 in montants) + (v2 in montants)
+                if appui >= 2:
+                    k = tuple(sorted([(r1, b1), (r2, b2)], reverse=True))
+                    sols[k] = max(sols.get(k, 0), appui)
+    if len(taux) >= 3 and not sols:                             # 3 taux : deux bases lues sur la pièce
+        for r1, r2, r3 in permutations(taux, 3):
+            for i, a1 in enumerate(montants):
+                for a2 in montants[i + 1:]:
+                    b3 = ht - a1 - a2
+                    if b3 <= 0: continue
+                    v1, v2 = tv(a1, r1), tv(a2, r2); v3 = tva - v1 - v2
+                    if abs(v3 - tv(b3, r3)) > tol: continue
+                    appui = sum(x in montants for x in (a1, a2, b3, v1, v2, v3))
+                    if appui >= 3:
+                        k = tuple(sorted([(r1, a1), (r2, a2), (r3, b3)], reverse=True))
+                        sols[k] = max(sols.get(k, 0), appui)
+    if not sols: return None
+    best = max(sols.values())
+    top = [k for k, v in sols.items() if v == best]
+    if len(top) != 1: return None                               # plusieurs solutions possibles : on ne devine pas
+    rows = [(r, b, tv(b, r)) for r, b in top[0]]
+    diff = tva - sum(v for _, _, v in rows)
+    rows[-1] = (rows[-1][0], rows[-1][1], rows[-1][2] + diff)    # écart d'arrondi sur le dernier taux
+    return rows
+
 # ----- date -----
 def _conv_date(d):
     d = d.strip()
@@ -791,12 +862,14 @@ def lire_texte(texte, type_, nom):
     tva_tot = ttc - ht
     A, B = _taux_lignes(lignes)
     vent = _ventiler([list(OrderedDict.fromkeys(A)), A, B], ht, tva_tot)
+    if vent is None and tva_tot and not _mono_taux_ok(ht, tva_tot):
+        vent = _ventiler_ancre(lignes, ht, tva_tot)
     if vent is None:
         if tva_tot == 0: vent = [(0.0, ht, Decimal("0"))]
         else:
             calc = float(tva_tot / ht * 100)
             proche = min(STD_TAUX, key=lambda x: abs(x - calc))
-            if abs(proche - calc) <= 0.3: taux = proche
+            if abs(proche - calc) <= 0.3 and _mono_taux_ok(ht, tva_tot): taux = proche
             else:
                 taux = round(calc, 1)
                 anom.append((f"Taux de TVA calculé {taux} % : facture multi-taux ou erreur, à vérifier", numero))
@@ -902,8 +975,12 @@ def _entete_index(lignes_cellules):
 def montant(v):
     if v is None or (isinstance(v, float) and pd.isna(v)) or str(v).strip() in ("", "nan"):
         return None
-    s = re.sub(r"[^\d,.\-]", "", str(v).replace("\u202f", "").replace(" ", ""))
-    if s.startswith("(") : s = "-" + s
+    brut = str(v).strip().replace("\u202f", "").replace("\xa0", "").replace(" ", "").replace("\u2212", "-")
+    negatif = (brut.startswith("(") and brut.endswith(")")) or bool(re.fullmatch(r"[^-]*\d[.,]?\d*-", brut))
+    s = re.sub(r"[^\d,.\-]", "", brut)
+    if s.endswith("-"): s = s[:-1]
+    if negatif and not s.startswith("-"): s = "-" + s
+    if not re.search(r"\d", s): return None
     if re.fullmatch(r"-?\d{1,3}([.,]\d{3})+", s): s = re.sub(r"[.,]", "", s)
     if "," in s and "." in s:
         s = s.replace(",", "") if s.rfind(".") > s.rfind(",") else s.replace(".", "").replace(",", ".")
@@ -912,11 +989,25 @@ def montant(v):
     try: return Decimal(s).quantize(Decimal("0.01"), ROUND_HALF_UP)
     except Exception: return None
 
+MOIS_FR = {"janvier": 1, "janv": 1, "fevrier": 2, "fevr": 2, "fev": 2, "mars": 3, "avril": 4, "avr": 4, "mai": 5,
+           "juin": 6, "juillet": 7, "juil": 7, "aout": 8, "septembre": 9, "sept": 9, "octobre": 10, "oct": 10,
+           "novembre": 11, "nov": 11, "decembre": 12, "dec": 12}
+
 def date(v):
-    s = str(v).strip()[:10]
-    for f in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%y", "%d.%m.%y", "%d-%m-%y", "%Y/%m/%d"):
+    if isinstance(v, datetime): return v
+    brut = str(v).strip()
+    s = brut[:10]
+    for f in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%y", "%d.%m.%y", "%d-%m-%y", "%Y/%m/%d", "%Y%m%d"):
         try: return datetime.strptime(s, f)
         except ValueError: pass
+    try: return datetime.strptime(s, "%m/%d/%Y")             # format américain (mois/jour) si le jour dépasse 12
+    except ValueError: pass
+    if re.fullmatch(r"\d{5}(\.0+)?", brut) and 30000 <= float(brut) <= 60000:   # date Excel en nombre (ex. 46086)
+        return datetime(1899, 12, 30) + timedelta(days=int(float(brut)))
+    m = re.fullmatch(r"(\d{1,2})\s+([a-z]+)\.?\s+(\d{4})", norm(brut))
+    if m and m.group(2) in MOIS_FR:
+        try: return datetime(int(m.group(3)), MOIS_FR[m.group(2)], int(m.group(1)))
+        except ValueError: return None
     return None
 
 def taux_str(t):
@@ -974,6 +1065,7 @@ def vers_pivot(df, m, anomalies, src=""):
         tva = montant(r[m["tva"]]) if "tva" in m else None
         ttc = montant(r[m["ttc"]]) if "ttc" in m else None
         taux = montant(r[m["taux_tva"]]) if "taux_tva" in m else None
+        if taux is not None and 0 < taux < 1: taux = (taux * 100).quantize(Decimal("0.1"))   # 0,2 -> 20 %
         if ht is None and ttc is not None and tva is not None: ht = ttc - tva
         if ht is None and ttc is not None and taux is not None:
             ht = (ttc / (1 + taux / 100)).quantize(Decimal("0.01"), ROUND_HALF_UP)
@@ -1159,6 +1251,53 @@ def msg_cadeau():
 
 INFOS = ("TVA non déductible appliquée", "Ventilation TVA lue sur la pièce")      # messages informatifs : non surlignés
 
+def controles_finaux(ecr, type_, exercice, anomalies):
+    """Derniers contrôles sur les écritures générées, avant écriture du FEC."""
+    tvac_pref, tiers_pref = "445", ("C", "F", "40", "41")
+    par_num = OrderedDict()
+    for e in ecr: par_num.setdefault(e["num"], []).append(e)
+    ex = str(exercice).strip()
+    hors = [ls[0] for ls in par_num.values() if ex.isdigit() and ls[0]["date"].year != int(ex)]
+    if hors and len(hors) > len(par_num) / 2:
+        ans = sorted({str(e["date"].year) for e in hors})
+        anomalies.append(("Dossier", f"Exercice saisi {ex} mais la plupart des factures sont datées de {', '.join(ans)} : vérifiez l'exercice", ""))
+    else:
+        for e in hors:
+            anomalies.append((e["ref"], f"Date hors exercice {ex} : {e['date']:%d/%m/%Y}", e["piece"]))
+    demain = datetime.now() + timedelta(days=1)
+    tiers_par_num = {}
+    for n, ls in par_num.items():
+        e0 = ls[0]
+        if e0["date"] > demain:
+            anomalies.append((e0["ref"], f"Date dans le futur : {e0['date']:%d/%m/%Y}", e0["piece"]))
+        if (not e0["tiers"] or e0["tiers"] == "A IDENTIFIER") and \
+           not any(a[1].startswith("Tiers non identifié") and a[2] == e0["piece"] for a in anomalies):
+            anomalies.append((e0["ref"], "Tiers non identifié : corrigez le nom", e0["piece"]))
+        if e0["piece"]:
+            tiers_par_num.setdefault((e0["fichier"], e0["piece"]), set()).add(e0["tiers"])
+        tot = sum(x["debit"] for x in ls)
+        if tot == 0:
+            anomalies.append((e0["ref"], "Facture à 0 € : aucune écriture utile", e0["piece"]))
+        lib = norm(e0["piece"] + " " + e0["lib"])
+        tiers_l = [x for x in ls if x["compte"].upper().startswith(tiers_pref)]
+        if tiers_l and re.search(r"\bavoir\b|\bav\b|credit note", lib):
+            sens_normal = "debit" if type_ == "vente" else "credit"
+            if tiers_l[0][sens_normal] > 0:
+                anomalies.append((e0["ref"], "Le libellé indique un avoir mais le montant est positif : vérifiez le signe", e0["piece"]))
+        for x in ls:
+            c = x["compte"].upper()
+            if c.startswith(tiers_pref) or c.startswith(tvac_pref): continue
+            if type_ == "achat" and not c.startswith(("6", "2", "4")):
+                anomalies.append((e0["ref"], f"Compte {x['compte']} inattendu pour un achat (6, 2 ou 4 attendu)", e0["piece"]))
+            if type_ == "vente" and not c.startswith(("7", "4")):
+                anomalies.append((e0["ref"], f"Compte {x['compte']} inattendu pour une vente (7 ou 4 attendu)", e0["piece"]))
+    for (f, num), ts in tiers_par_num.items():
+        if len(ts) > 1:
+            anomalies.append((f, f"N° {num} utilisé pour plusieurs tiers : {', '.join(sorted(ts))[:80]}", num))
+    for n, msg, bloq in valider_ecritures(ecr):
+        e0 = par_num[n][0]
+        anomalies.append((e0["ref"], ("Erreur : " if bloq else "") + msg, e0["piece"]))
+
 def tagger_alertes(ecritures, anomalies):
     """Ajoute à chaque écriture le texte des alertes/erreurs qui la concernent (colonne 'alerte')."""
     msgs = {}
@@ -1226,6 +1365,16 @@ def construire_ecritures(lignes, type_, anomalies, regles=None, comptes=None, tv
         for t in tva_par_taux:
             if t not in tvac and t not in ("0", "0.0"):
                 anomalies.append((ls[0]["n"], f"Taux de TVA inhabituel : {t}%", numero))
+            try:
+                base = sum(x["ht"] for x in ls if x["taux"] == t)
+                attendu = (base * Decimal(t) / 100).quantize(Decimal("0.01"), ROUND_HALF_UP)
+                ecart = abs(attendu - tva_par_taux[t])
+                if ecart > max(Decimal("0.05"), abs(attendu) * Decimal("0.01")) * (1 + len(ls) // 5):
+                    anomalies.append((ls[0]["n"], f"TVA {t} % incohérente : {tva_par_taux[t]} lue, {attendu} attendue", numero))
+            except Exception:
+                pass
+        if len(ls) > 1 and len({(x["ht"], x["tva"], x["ttc"], x.get("libelle", "")) for x in ls}) == 1:
+            anomalies.append((ls[0]["n"], f"{len(ls)} lignes identiques dans la facture : montants répétés ? (total multiplié)", numero))
         avoir = ttc_calc < 0
         num += 1
         lib = f"{numero} {tiers}".strip()[:100]
@@ -1291,10 +1440,11 @@ def ecrire_fec(ecritures, type_, siren, exercice, sortie, comptes=None, separate
     nom = os.path.join(sortie, f"{siren}FEC{exercice}1231.txt") if exercice else os.path.join(sortie, f"{siren}FEC{fin}.txt")
     with open(nom, "w", encoding="utf-8", newline="") as f:
         sep = "|" if separateur == "pipe" else "\t"
+        net = lambda x: re.sub(r"\s+", " ", str(x).replace("|", "/").replace("\t", " ")).strip()
         f.write(sep.join(FEC_COLS) + "\r\n")
         for e in ecritures:
             dd = e["date"].strftime("%Y%m%d")
-            f.write(sep.join([jc, jl, str(e["num"]), dd, e["compte"], e["libc"], e["aux"], e["auxl"],
+            f.write(sep.join(net(x) for x in [jc, jl, str(e["num"]), dd, e["compte"], e["libc"], e["aux"], e["auxl"],
                                e["piece"], dd, e["lib"], fmt(e["debit"]), fmt(e["credit"]),
                                "", "", dd, "", ""]) + "\r\n")
     return nom, d_tot
@@ -1385,6 +1535,8 @@ def _ventilation_piece(info, page, ht, tva):
     lignes = [l.strip() for l in _norm_txt(texte).splitlines() if l.strip()]
     A, B = _taux_lignes(lignes)
     vent = _ventiler([list(OrderedDict.fromkeys(A)), A, B], ht, tva)
+    if (not vent or len(vent) < 2) and not _mono_taux_ok(ht, tva):
+        vent = _ventiler_ancre(lignes, ht, tva)
     return vent if vent and len(vent) >= 2 else None
 
 def rapprocher(lignes, pieces, manuels=None, ventiler=True):
@@ -1578,6 +1730,14 @@ def traiter(fichiers, type_="vente", siren="000000000", exercice="", sortie=".",
             anomalies.append((rr["cle"].split("|")[0], f"Ventilation TVA lue sur la pièce : {rr['ventilation']}", rr["numero"]))
         if not rr["piece"]:
             anomalies.append((rr["cle"].split("|")[0], "Pièce justificative non trouvée (" + rr["methode"] + ")", rr["numero"]))
+    groupes = OrderedDict()                                   # factures mono-taux dont la TVA ne colle à aucun taux unique
+    for l in lignes: groupes.setdefault(cle_de(l), []).append(l)
+    for cle, inv in groupes.items():
+        if cle in (ventilations or {}) or any(m["cle"] == cle for m in multi): continue
+        ht_s, tva_s = sum(l["ht"] for l in inv), sum(l["tva"] for l in inv)
+        if len({l["taux"] for l in inv}) == 1 and tva_s and not _mono_taux_ok(ht_s, tva_s):
+            multi.append({"cle": cle, "numero": inv[0]["numero"], "tiers": inv[0]["tiers"], "ht": str(ht_s), "tva": str(tva_s)})
+            anomalies.append((cle.split("|")[0], f"TVA ({tva_s}) ne correspond à aucun taux unique : facture multi-taux à ventiler", inv[0]["numero"]))
     factures = list(OrderedDict(((f"{l['n'].rsplit(':', 1)[0]}|{l['numero']}"),
                                  {"cle": f"{l['n'].rsplit(':', 1)[0]}|{l['numero']}", "fichier": l["n"].rsplit(":", 1)[0],
                                   "numero": l["numero"], "tiers": l["tiers"]}) for l in lignes).values())
@@ -1586,6 +1746,7 @@ def traiter(fichiers, type_="vente", siren="000000000", exercice="", sortie=".",
                                comptes, tva_comptes, produits_tva,
                                preparer_nd(tva_nd if tva_nd is not None else tva_nd_defaut_df(), vehicule, carburant, comptes_carburant),
                                tiers_au_compte)
+    controles_finaux(ecr, type_, exercice, anomalies)
     tagger_alertes(ecr, anomalies)
     fec, total = ecrire_fec(ecr, type_, siren, exercice, sortie, comptes, separateur)
     sources = {os.path.basename(f): f for f in list(fichiers) + list(pieces or [])}

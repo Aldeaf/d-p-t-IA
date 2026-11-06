@@ -16,6 +16,28 @@ if _manque:
              "). Remplacez-le par la dernière version, puis faites Manage app → Reboot app.")
     st.stop()
 rerun = getattr(st, "rerun", None) or st.experimental_rerun   # compatibilité anciennes versions de Streamlit
+_cd = getattr(st, "cache_data", None)
+cache = (lambda f: _cd(show_spinner=False, max_entries=200)(f)) if _cd else (lambda f: f)
+
+@cache
+def lire_cache(chemin, mtime):
+    """Lecture d'un CSV/Excel mise en cache (évite de relire le fichier à chaque clic)."""
+    return ag.lire(chemin)
+
+@cache
+def images_pdf(chemin, page, mtime):
+    """Pages d'un PDF converties en images PNG, mises en cache."""
+    import io as _io, pdfplumber
+    out = []
+    with pdfplumber.open(chemin) as pdf:
+        pages = [pdf.pages[int(page) - 1]] if page else pdf.pages[:4]
+        for pg in pages:
+            b = _io.BytesIO(); pg.to_image(resolution=110).original.save(b, format="PNG"); out.append(b.getvalue())
+    return out
+
+def mtime(p):
+    try: return os.path.getmtime(p)
+    except OSError: return 0
 
 # ---------- état initial (avant tout widget) ----------
 def tva_df(d):
@@ -95,17 +117,14 @@ def afficher_piece(e):
     ext = os.path.splitext(chemin)[1].lower()
     try:
         if ext == ".pdf":
-            import pdfplumber
-            with pdfplumber.open(chemin) as pdf:
-                pages = [pdf.pages[int(e["page"]) - 1]] if e["page"] else pdf.pages[:4]
-                for p in pages:
-                    st.image(p.to_image(resolution=110).original, use_container_width=True)
+            for img in images_pdf(chemin, e["page"], mtime(chemin)):
+                st.image(img, use_container_width=True)
         elif ext in (".png", ".jpg", ".jpeg"):
             st.image(chemin, use_container_width=True)
         elif ext == ".xml":
             st.code(open(chemin, encoding="utf-8", errors="replace").read()[:4000], language="xml")
         else:
-            df = ag.lire(chemin)
+            df = lire_cache(chemin, mtime(chemin))
             st.dataframe(df[df.astype(str).apply(lambda l: str(e["piece"]) in l.values, axis=1)], use_container_width=True)
     except Exception as ex:
         st.warning(f"Aperçu impossible : {ex}")
@@ -158,6 +177,8 @@ with tab1:
         st.caption(f"{len(tabulaires)} fichier(s) comptable(s) · {len(docs)} PDF/image(s) · "
                    + ("les PDF servent de pièces justificatives." if pieces_noms else "les PDF sont lus comme des factures."))
 
+    signature = (type_, siren.strip(), exercice.strip(), tuple(sorted(chemins)), tuple(sorted(pieces_noms)))
+
     def lancer():
         c, t, p = comptes_ui()
         maps = {n: mapping_choisi(n) for n in tabulaires if mapping_choisi(n)}
@@ -174,8 +195,12 @@ with tab1:
                                     comptes_carburant=ss.get("veh_cpt", ag.COMPTE_CARBURANT_DEFAUT),
                                     ventiler_pieces=ss.get("ventiler_pieces", True))
             ss.err = None
+            ss.res_sig = signature
         except ValueError as e:
             ss.res, ss.err = None, str(e)
+        except Exception as e:                              # erreur imprévue : message lisible au lieu d'un plantage
+            ss.res, ss.err = None, (f"Erreur inattendue pendant l'analyse ({type(e).__name__} : {e}). "
+                                    "Vérifiez les fichiers déposés et les colonnes dans Réglages, puis relancez.")
 
     if chemins and st.button(f"Générer le FEC ({'clients' if type_ == 'vente' else 'fournisseurs'})", type="primary"):
         lancer()
@@ -183,11 +208,23 @@ with tab1:
     if ss.get("err"):
         st.error(ss.err)
     r = ss.get("res")
+    if r and ss.get("res_sig") != signature:                # fichiers / type / SIREN / exercice changés depuis le calcul
+        st.info("Fichiers ou paramètres modifiés : touchez « Générer le FEC » pour mettre le résultat à jour.")
+        r = None
     if r:
         c1, c2, c3 = st.columns(3)
         c1.metric("Lignes d'écriture", len(r["ecritures"]))
         c2.metric("Total débit = crédit", f"{r['total']:,.2f} €".replace(",", " "))
-        c3.metric("Anomalies", len(r["anomalies"]))
+        infos = ag.INFOS + ("Aucune règle d'imputation",)
+        erreurs = [a for a in r["anomalies"] if a[1].startswith("Erreur")]
+        a_voir = [a for a in r["anomalies"] if not a[1].startswith(infos) and a not in erreurs]
+        c3.metric("Points à vérifier", len(a_voir) + len(erreurs))
+        if erreurs:
+            st.error(f"⛔ {len(erreurs)} erreur(s) bloquante(s) : corrigez-les avant l'import dans ACD.")
+        elif a_voir:
+            st.warning(f"⚠️ {len(a_voir)} point(s) à vérifier (écritures surlignées en jaune). Le FEC est équilibré.")
+        else:
+            st.success("✅ Contrôle final OK : FEC équilibré, aucune alerte. Prêt pour l'import dans ACD.")
         st.download_button("⬇️ Télécharger le FEC", open(r["fec"], "rb").read(),
                            file_name=os.path.basename(r["fec"]), mime="text/plain", type="primary")
         if r.get("zip"):
@@ -265,10 +302,17 @@ with tab1:
                     ss.imput_courant = ss.imput_base
                     lancer()
                     rerun()
-        rest = [a for a in r["anomalies"] if not a[1].startswith("Aucune règle d'imputation")]
-        if rest:
+        rest = sorted([a for a in r["anomalies"] if not a[1].startswith("Aucune règle d'imputation")],
+                      key=lambda a: (not a[1].startswith("Erreur"), a[1].startswith(ag.INFOS), str(a[0])))
+        pbs = [a for a in rest if not a[1].startswith(ag.INFOS)]
+        infos_l = [a for a in rest if a[1].startswith(ag.INFOS)]
+        if pbs:
             st.warning("Points à vérifier avant import dans ACD :")
-            st.dataframe(pd.DataFrame(rest, columns=["Fichier:ligne", "Anomalie", "Détail"]), use_container_width=True)
+            st.dataframe(pd.DataFrame(pbs, columns=["Fichier:ligne", "Anomalie", "Détail"]), use_container_width=True, hide_index=True)
+        if infos_l:
+            with st.expander(f"ℹ️ {len(infos_l)} information(s) (TVA non déductible, ventilation lue sur la pièce)"):
+                st.dataframe(pd.DataFrame(infos_l, columns=["Fichier:ligne", "Information", "Détail"]), use_container_width=True, hide_index=True)
+        if r.get("rapport"):
             st.download_button("Télécharger le rapport", open(r["rapport"], "rb").read(), file_name="rapport_anomalies.csv")
         st.subheader("Écritures")
         ecr = pd.DataFrame(r["ecritures"])
@@ -279,6 +323,8 @@ with tab1:
             st.caption(f"🟡 {nb_al} écriture(s) en alerte (surlignées en jaune) : voir la colonne « alerte ».")
         st.caption("Touchez une ligne pour afficher la facture correspondante.")
         vue = ecr[["num", "date", "compte", "aux", "piece", "lib", "debit", "credit", "alerte"]].copy()
+        if nb_al and st.checkbox("Afficher uniquement les écritures en alerte", key="seul_alertes"):
+            vue = vue[vue["num"].isin(set(ecr.loc[ecr["alerte"] != "", "num"]))]
         vue["date"] = pd.to_datetime(vue["date"]).dt.strftime("%d/%m/%Y")
         for k in ("debit", "credit"):
             vue[k] = vue[k].astype(float)
@@ -292,8 +338,8 @@ with tab1:
             ev = st.dataframe(vue.style.apply(_jaune, axis=1).format({"debit": "{:.2f}", "credit": "{:.2f}"}),
                               on_select="rerun", selection_mode="single-row", hide_index=True,
                               use_container_width=True, key="tbl_ecr")
-            if ev.selection.rows:
-                sel = ecr.iloc[ev.selection.rows[0]]
+            if ev.selection.rows and ev.selection.rows[0] < len(vue):
+                sel = ecr.loc[vue.index[ev.selection.rows[0]]]
         except Exception:                                   # anciennes versions de Streamlit
             st.dataframe(vue.style.apply(_jaune, axis=1), hide_index=True, use_container_width=True)
             uniques = ecr.drop_duplicates("num")
@@ -361,7 +407,7 @@ with tab3:
         for nom in tabulaires:
             st.markdown(f"**{nom}**")
             try:
-                df = ag.lire(chemins[nom])
+                df = lire_cache(chemins[nom], mtime(chemins[nom]))
             except Exception as e:
                 st.error(f"Lecture impossible : {e}"); continue
             detecte = ag.charger_mapping(df, type_=type_)
