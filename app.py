@@ -9,7 +9,7 @@ st.title("🧾 Agent Fec")
 ss = st.session_state
 
 # Vérifie que agent_fec.py est bien la dernière version (sinon message clair au lieu d'une erreur masquée)
-_REQUIS = ["VERSION", "CHAMPS_LIBELLES", "importer_reglages", "exporter_reglages", "fusionner_modele", "sauver_mapping", "creer_archive", "extraire_zip", "rapprocher", "produits_par_taux", "preparer_nd", "colonnes_par_taux", "tva_nd_defaut_df", "OBLIGATOIRES", "TVA_COMPTES", "regenerer", "migrer_modele", "VEHICULES", "CARBURANTS", "pct_deductible_carburant", "valider_ecritures", "COLS_ND", "purger_caches"]
+_REQUIS = ["VERSION", "CHAMPS_LIBELLES", "importer_reglages", "exporter_reglages", "fusionner_modele", "sauver_mapping", "creer_archive", "extraire_zip", "rapprocher", "produits_par_taux", "preparer_nd", "colonnes_par_taux", "tva_nd_defaut_df", "OBLIGATOIRES", "TVA_COMPTES", "regenerer", "migrer_modele", "VEHICULES", "CARBURANTS", "pct_deductible_carburant", "valider_ecritures", "COLS_ND", "purger_caches", "bornes_exercice", "NOTES"]
 _manque = [n for n in _REQUIS if not hasattr(ag, n)]
 if _manque:
     st.error("agent_fec.py n'est pas à jour sur GitHub (il manque : " + ", ".join(_manque) +
@@ -186,9 +186,23 @@ def afficher_piece(e):
 # ---------- page ----------
 LIBELLES = {"vente": "🧑‍💼 Clients (factures de vente)", "achat": "🏭 Fournisseurs (factures d'achat)"}
 type_ = st.radio("Je traite des…", list(LIBELLES), format_func=LIBELLES.get, horizontal=True)
+import datetime as _dt
+siren = st.text_input("SIREN du dossier", "000000000")
 col1, col2 = st.columns(2)
-siren = col1.text_input("SIREN du dossier", "000000000")
-exercice = col2.text_input("Exercice (AAAA)", "2026")
+def _date_ui(col, label, defaut, cle):
+    try: return col.date_input(label, defaut, format="DD/MM/YYYY", key=cle)
+    except TypeError: return col.date_input(label, defaut, key=cle)      # anciennes versions de Streamlit
+_an = _dt.date.today().year
+debut_ex = _date_ui(col1, "Début d'exercice", _dt.date(_an, 1, 1), "ex_debut")
+fin_ex = _date_ui(col2, "Fin d'exercice (clôture)", _dt.date(_an, 12, 31), "ex_fin")
+exercice = fin_ex.strftime("%Y%m%d")                       # le FEC est nommé d'après la date de clôture
+_duree = (fin_ex.year - debut_ex.year) * 12 + fin_ex.month - debut_ex.month + 1
+if fin_ex <= debut_ex:
+    st.error("La fin d'exercice doit être postérieure au début.")
+elif _duree > 24:
+    st.warning(f"Exercice de {_duree} mois : la durée maximale est normalement de 24 mois (1er exercice).")
+elif _duree != 12:
+    st.caption(f"Exercice de {_duree} mois.")
 with st.sidebar:
     st.caption(f"Agent Fec · version {ag.VERSION}")
     if st.button("🧹 Effacer mes fichiers et résultats"):
@@ -240,14 +254,14 @@ with tab1:
         st.caption(f"{len(tabulaires)} fichier(s) comptable(s) · {len(docs)} PDF/image(s) · "
                    + ("les PDF servent de pièces justificatives." if pieces_noms else "les PDF sont lus comme des factures."))
 
-    signature = (type_, siren.strip(), exercice.strip(), tuple(sorted(chemins)), tuple(sorted(pieces_noms)))
+    signature = (type_, siren.strip(), str(debut_ex), str(fin_ex), tuple(sorted(chemins)), tuple(sorted(pieces_noms)))
 
     def lancer():
         c, t, p = comptes_ui()
         maps = {n: mapping_choisi(n) for n in tabulaires if mapping_choisi(n)}
         try:
             with st.spinner("Analyse en cours…"), atelier(list(ss.mem)) as (dossier, ch):
-                ss.res = figer(ag.traiter([ch[n] for n in a_traiter], type_, siren, exercice, dossier,
+                ss.res = figer(ag.traiter([ch[n] for n in a_traiter], type_, siren, exercice, dossier, debut_exercice=debut_ex,
                                     regles=ss.get("imput_courant", ss.imput_base), mappings=maps, comptes=c, tva_comptes=t, produits_tva=p,
                                     separateur="pipe" if ss.get("sep_fec") == "Pipe |" else "tab",
                                     tiers_corriges=ss.get("tiers_corriges"),
@@ -278,7 +292,7 @@ with tab1:
         c1, c2, c3 = st.columns(3)
         c1.metric("Lignes d'écriture", len(r["ecritures"]))
         c2.metric("Total débit = crédit", f"{r['total']:,.2f} €".replace(",", " "))
-        infos = ag.INFOS + ("Aucune règle d'imputation",)
+        infos = ag.INFOS + ag.NOTES + ("Aucune règle d'imputation",)
         erreurs = [a for a in r["anomalies"] if a[1].startswith("Erreur")]
         a_voir = [a for a in r["anomalies"] if not a[1].startswith(infos) and a not in erreurs]
         c3.metric("Points à vérifier", len(a_voir) + len(erreurs))
@@ -371,35 +385,47 @@ with tab1:
                     rerun()
         rest = sorted([a for a in r["anomalies"] if not a[1].startswith("Aucune règle d'imputation")],
                       key=lambda a: (not a[1].startswith("Erreur"), a[1].startswith(ag.INFOS), str(a[0])))
-        pbs = [a for a in rest if not a[1].startswith(ag.INFOS)]
-        infos_l = [a for a in rest if a[1].startswith(ag.INFOS)]
+        pbs = [a for a in rest if not a[1].startswith(ag.INFOS + ag.NOTES)]
+        infos_l = [a for a in rest if a[1].startswith(ag.INFOS + ag.NOTES)]
         if pbs:
             st.warning("Points à vérifier avant import dans ACD :")
             st.dataframe(pd.DataFrame(pbs, columns=["Fichier:ligne", "Anomalie", "Détail"]), use_container_width=True, hide_index=True)
         if infos_l:
-            with st.expander(f"ℹ️ {len(infos_l)} information(s) (TVA non déductible, ventilation lue sur la pièce)"):
+            with st.expander(f"ℹ️ {len(infos_l)} information(s) (dates d'exercice, TVA non déductible, ventilation)"):
                 st.dataframe(pd.DataFrame(infos_l, columns=["Fichier:ligne", "Information", "Détail"]), use_container_width=True, hide_index=True)
         if r.get("rapport_octets"):
             st.download_button("Télécharger le rapport", r["rapport_octets"], file_name="rapport_anomalies.csv")
         st.subheader("Écritures")
         ecr = pd.DataFrame(r["ecritures"])
-        if "alerte" not in ecr: ecr["alerte"] = ""
-        ecr["alerte"] = ecr["alerte"].fillna("")
-        nb_al = int((ecr.drop_duplicates("num")["alerte"] != "").sum()) if len(ecr) else 0
+        for k in ("alerte", "note"):
+            if k not in ecr: ecr[k] = ""
+            ecr[k] = ecr[k].fillna("")
+        if "date_piece" not in ecr: ecr["date_piece"] = None
+        ecr["date_piece"] = ecr["date_piece"].where(ecr["date_piece"].notna(), ecr["date"])
+        uniq = ecr.drop_duplicates("num") if len(ecr) else ecr
+        nb_al = int((uniq["alerte"] != "").sum())
+        nb_vert = int(((uniq["note"] != "") & (uniq["alerte"] == "")).sum())
         if nb_al:
             st.caption(f"🟡 {nb_al} écriture(s) en alerte (surlignées en jaune) : voir la colonne « alerte ».")
+        if nb_vert:
+            st.caption(f"🟢 {nb_vert} écriture(s) hors dates d'exercice mais traitées (vert pâle) : voir la colonne « remarque ».")
         st.caption("Touchez une ligne pour afficher la facture correspondante.")
-        vue = ecr[["num", "date", "compte", "aux", "piece", "lib", "debit", "credit", "alerte"]].copy()
+        vue = ecr[["num", "date", "date_piece", "compte", "aux", "piece", "lib", "debit", "credit", "alerte", "note"]].copy()
         if nb_al and st.checkbox("Afficher uniquement les écritures en alerte", key="seul_alertes"):
             vue = vue[vue["num"].isin(set(ecr.loc[ecr["alerte"] != "", "num"]))]
         vue["date"] = pd.to_datetime(vue["date"]).dt.strftime("%d/%m/%Y")
+        vue["date_piece"] = pd.to_datetime(vue["date_piece"]).dt.strftime("%d/%m/%Y")
+        vue = vue.rename(columns={"date_piece": "date pièce", "note": "remarque"})
         for k in ("debit", "credit"):
             vue[k] = vue[k].astype(float)
         jaune = vue["alerte"] != ""
         # une alerte colore toutes les lignes de l'écriture concernée
         nums_al = set(vue.loc[jaune, "num"])
+        nums_vert = set(vue.loc[vue["remarque"] != "", "num"]) - nums_al     # jaune prioritaire sur vert
         def _jaune(row):
-            return ["background-color: #FFF9C4; color: #000"] * len(row) if row["num"] in nums_al else [""] * len(row)
+            if row["num"] in nums_al: return ["background-color: #FFF9C4; color: #000"] * len(row)
+            if row["num"] in nums_vert: return ["background-color: #E8F5E9; color: #000"] * len(row)
+            return [""] * len(row)
         sel = None
         try:
             ev = st.dataframe(vue.style.apply(_jaune, axis=1).format({"debit": "{:.2f}", "credit": "{:.2f}"}),
@@ -419,13 +445,13 @@ with tab1:
         with st.expander("✏️ Modifier les écritures", expanded=False):
             st.caption("Modifiez comptes, libellés, montants ou dates ; ajoutez une ligne (+) en indiquant le n° d'écriture. "
                        "Le débit doit égaler le crédit pour chaque écriture.")
-            cols_ed = ["num", "date", "compte", "libc", "aux", "auxl", "piece", "lib", "debit", "credit", "alerte"]
+            cols_ed = ["num", "date", "compte", "libc", "aux", "auxl", "piece", "lib", "debit", "credit", "alerte", "note"]
             base = ecr[cols_ed].copy()
             base["date"] = pd.to_datetime(base["date"]).dt.strftime("%Y-%m-%d")
             for k in ("debit", "credit"):
                 base[k] = base[k].astype(float)
             ed_e = st.data_editor(base, num_rows="dynamic", hide_index=True, use_container_width=True,
-                                  disabled=["alerte"], key=f"ed_ecr_{ss.get('n_ecr', 0)}")
+                                  disabled=["alerte", "note"], key=f"ed_ecr_{ss.get('n_ecr', 0)}")
             if st.button("Valider mes modifications et régénérer le FEC"):
                 try:
                     with atelier(list(ss.mem)) as (dossier, ch):

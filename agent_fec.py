@@ -12,7 +12,7 @@ PDF/images : Factur-X (XML intégré) -> texte du PDF (règles) -> OCR PaddleOCR
 -> IA Claude (facultatif, payant, si ANTHROPIC_API_KEY est défini).
 """
 import argparse, hashlib, io, json, os, re, shutil, sys, tempfile, unicodedata, zipfile
-VERSION = "2026.11.06-q"
+VERSION = "2026.11.06-r"
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from decimal import Decimal, ROUND_HALF_UP
@@ -1288,19 +1288,54 @@ def msg_cadeau():
 
 INFOS = ("TVA non déductible appliquée", "Ventilation TVA lue sur la pièce", "Contrôle des montants impossible")      # messages informatifs : non surlignés
 
-def controles_finaux(ecr, type_, exercice, anomalies):
-    """Derniers contrôles sur les écritures générées, avant écriture du FEC."""
+NOTES = ("Pièce antérieure à l'exercice", "Pièce de l'exercice suivant")   # remarques : surlignage vert pâle
+
+def _ajouter_mois(d, n):
+    m = d.month - 1 + n
+    a, m = d.year + m // 12, m % 12 + 1
+    import calendar
+    return d.replace(year=a, month=m, day=min(d.day, calendar.monthrange(a, m)[1]))
+
+def bornes_exercice(exercice="", debut=None):
+    """(début, fin) de l'exercice. exercice : « 2026 » (année civile), « 20260630 » ou date de clôture ;
+    début facultatif (sinon 12 mois avant la clôture). Gère les exercices décalés."""
+    ex = exercice
+    if isinstance(ex, datetime): fin = ex
+    else:
+        ex = re.sub(r"\D", "", str(ex or ""))
+        if len(ex) == 4: fin = datetime(int(ex), 12, 31)
+        elif len(ex) == 8: fin = datetime.strptime(ex, "%Y%m%d")
+        else: return None, None
+    if debut is not None and not isinstance(debut, datetime):
+        debut = date(debut) if isinstance(debut, str) else datetime(debut.year, debut.month, debut.day)
+    if debut is None:
+        debut = _ajouter_mois(fin, -12) + timedelta(days=1)
+    return debut.replace(hour=0, minute=0, second=0, microsecond=0), fin.replace(hour=0, minute=0, second=0, microsecond=0)
+
+def controles_finaux(ecr, type_, exercice, anomalies, debut_exercice=None):
+    """Derniers contrôles sur les écritures générées, avant écriture du FEC.
+    Exercice (éventuellement décalé) : pièce antérieure -> comptabilisée au 1er jour de l'exercice (date de pièce gardée) ;
+    pièce de l'exercice suivant -> acceptée telle quelle ; les deux sont signalées en vert. Au-delà : alerte."""
     tvac_pref, tiers_pref = "445", ("C", "F", "40", "41")
     par_num = OrderedDict()
     for e in ecr: par_num.setdefault(e["num"], []).append(e)
-    ex = str(exercice).strip()
-    hors = [ls[0] for ls in par_num.values() if ex.isdigit() and ls[0]["date"].year != int(ex)]
-    if hors and len(hors) > len(par_num) / 2:
-        ans = sorted({str(e["date"].year) for e in hors})
-        anomalies.append(("Dossier", f"Exercice saisi {ex} mais la plupart des factures sont datées de {', '.join(ans)} : vérifiez l'exercice", ""))
-    else:
-        for e in hors:
-            anomalies.append((e["ref"], f"Date hors exercice {ex} : {e['date']:%d/%m/%Y}", e["piece"]))
+    debut, fin = bornes_exercice(exercice, debut_exercice)
+    if debut:
+        fin_suivant = _ajouter_mois(fin, 12)
+        hors = [ls for ls in par_num.values() if not (debut <= ls[0]["date"] <= fin_suivant)]
+        if len(par_num) >= 3 and len(hors) > len(par_num) / 2:
+            anomalies.append(("Dossier", f"Exercice du {debut:%d/%m/%Y} au {fin:%d/%m/%Y} : la plupart des factures sont "
+                                         "en dehors, vérifiez les dates d'exercice", ""))
+        for ls in par_num.values():
+            d0 = ls[0]["date"]
+            if d0 < debut:
+                for x in ls:
+                    x["date_piece"] = x.get("date_piece") or x["date"]; x["date"] = debut
+                anomalies.append((ls[0]["ref"], f"Pièce antérieure à l'exercice (datée du {d0:%d/%m/%Y}) : comptabilisée au {debut:%d/%m/%Y}", ls[0]["piece"]))
+            elif fin < d0 <= fin_suivant:
+                anomalies.append((ls[0]["ref"], f"Pièce de l'exercice suivant (datée du {d0:%d/%m/%Y}) : conservée à sa date", ls[0]["piece"]))
+            elif d0 > fin_suivant:
+                anomalies.append((ls[0]["ref"], f"Date hors exercice : {d0:%d/%m/%Y} (au-delà de l'exercice suivant)", ls[0]["piece"]))
     demain = datetime.now() + timedelta(days=1)
     tiers_par_num = {}
     for n, ls in par_num.items():
@@ -1337,16 +1372,19 @@ def controles_finaux(ecr, type_, exercice, anomalies):
 
 def tagger_alertes(ecritures, anomalies):
     """Ajoute à chaque écriture le texte des alertes/erreurs qui la concernent (colonne 'alerte')."""
-    msgs = {}
+    msgs, notes = {}, {}
     for ref, msg, detail in anomalies:
         if msg.startswith(INFOS): continue
+        cible = notes if msg.startswith(NOTES) else msgs
         f = str(ref).split(":")[0]
         for e in ecritures:
-            if (detail == e["piece"] and f == e["fichier"]) or (detail and detail == e["tiers"]) or ref == e["ref"]:
-                lst = msgs.setdefault(e["num"], [])
+            if (detail == e["piece"] and f == e["fichier"]) or ref == e["ref"] or \
+               (detail and detail == e["tiers"] and cible is msgs):
+                lst = cible.setdefault(e["num"], [])
                 if msg not in lst: lst.append(msg)
     for e in ecritures:
         e["alerte"] = " | ".join(msgs.get(e["num"], []))
+        e["note"] = " | ".join(notes.get(e["num"], []))
 
 # ---------- Contrôles + écritures ----------
 FORMES_DEBUT = {"sarl", "sas", "sasu", "eurl", "sa", "sci", "snc", "scop", "selarl", "earl", "gaec", "ets", "etablissements",
@@ -1476,16 +1514,18 @@ def ecrire_fec(ecritures, type_, siren, exercice, sortie, comptes=None, separate
     fmt = lambda x: f"{x:.2f}".replace(".", ",")
     d_tot = sum(e["debit"] for e in ecritures); c_tot = sum(e["credit"] for e in ecritures)
     if d_tot != c_tot: raise ValueError(f"FEC déséquilibré : D={d_tot} C={c_tot}")
-    fin = max(e["date"] for e in ecritures).strftime("%Y%m%d")
-    nom = os.path.join(sortie, f"{siren}FEC{exercice}1231.txt") if exercice else os.path.join(sortie, f"{siren}FEC{fin}.txt")
+    _, cloture = bornes_exercice(exercice)
+    fin = (cloture or max(e["date"] for e in ecritures)).strftime("%Y%m%d")
+    nom = os.path.join(sortie, f"{siren}FEC{fin}.txt")
     with open(nom, "w", encoding="utf-8", newline="") as f:
         sep = "|" if separateur == "pipe" else "\t"
         net = lambda x: re.sub(r"\s+", " ", str(x).replace("|", "/").replace("\t", " ")).strip()
         f.write(sep.join(FEC_COLS) + "\r\n")
         for e in ecritures:
             dd = e["date"].strftime("%Y%m%d")
+            dp = (e.get("date_piece") or e["date"]).strftime("%Y%m%d")         # date de la pièce d'origine
             f.write(sep.join(net(x) for x in [jc, jl, str(e["num"]), dd, e["compte"], e["libc"], e["aux"], e["auxl"],
-                               e["piece"], dd, e["lib"], fmt(e["debit"]), fmt(e["credit"]),
+                               e["piece"], dp, e["lib"], fmt(e["debit"]), fmt(e["credit"]),
                                "", "", dd, "", ""]) + "\r\n")
     return nom, d_tot
 
@@ -1774,7 +1814,8 @@ def ecritures_depuis_df(df, originaux):
         out.append(dict(num=num, src=o.get("src", ""), page=o.get("page", ""), tiers=o.get("tiers", ""),
                         fichier=o.get("fichier", ""), ref=o.get("ref", ""), date=d, compte=_s(r["compte"]), libc=_s(r["libc"]),
                         aux=_s(r["aux"]), auxl=_s(r.get("auxl", "")), piece=_s(r["piece"]) or o.get("piece", ""),
-                        lib=_s(r["lib"]), debit=deb, credit=cre, alerte=_s(r.get("alerte", ""))))
+                        lib=_s(r["lib"]), debit=deb, credit=cre, alerte=_s(r.get("alerte", "")),
+                        note=_s(r.get("note", "")) or o.get("note", ""), date_piece=o.get("date_piece")))
     return sorted(out, key=lambda e: e["num"])
 
 def regenerer(df, originaux, type_, siren, exercice, sortie, comptes=None, separateur="tab", sources=None):
@@ -1795,7 +1836,8 @@ def traiter(*args, **kwargs):
 
 def _traiter(fichiers, type_="vente", siren="000000000", exercice="", sortie=".", regles=None,
             mappings=None, comptes=None, tva_comptes=None, separateur="tab", tiers_corriges=None, pieces=None, rapprochements=None, produits_tva=None, tva_nd=None, tiers_au_compte=True, ventilations=None,
-            vehicule="VP", carburant="Gazole", comptes_carburant=COMPTE_CARBURANT_DEFAUT, ventiler_pieces=True):
+            vehicule="VP", carburant="Gazole", comptes_carburant=COMPTE_CARBURANT_DEFAUT, ventiler_pieces=True,
+            debut_exercice=None):
     anomalies, lignes = [], []
     for f in fichiers:
         nom = os.path.basename(f)
@@ -1863,7 +1905,7 @@ def _traiter(fichiers, type_="vente", siren="000000000", exercice="", sortie="."
                                comptes, tva_comptes, produits_tva,
                                preparer_nd(tva_nd if tva_nd is not None else tva_nd_defaut_df(), vehicule, carburant, comptes_carburant),
                                tiers_au_compte)
-    controles_finaux(ecr, type_, exercice, anomalies)
+    controles_finaux(ecr, type_, exercice, anomalies, debut_exercice)
     tagger_alertes(ecr, anomalies)
     fec, total = ecrire_fec(ecr, type_, siren, exercice, sortie, comptes, separateur)
     sources = {os.path.basename(f): f for f in list(fichiers) + list(pieces or [])}
