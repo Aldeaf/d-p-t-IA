@@ -12,7 +12,7 @@ PDF/images : Factur-X (XML intégré) -> texte du PDF (règles) -> OCR PaddleOCR
 -> IA Claude (facultatif, payant, si ANTHROPIC_API_KEY est défini).
 """
 import argparse, hashlib, io, json, os, re, shutil, sys, tempfile, unicodedata, zipfile
-VERSION = "2026.11.06-u"
+VERSION = "2026.11.06-v"
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from decimal import Decimal, ROUND_HALF_UP
@@ -877,19 +877,24 @@ def _numero(texte):
     return ""
 
 # ----- tiers -----
+# « Client », « Cliente », « Client(e) », « Clients », « Nom du client », « Informations cliente », « Coordonnées client »…
+CLIENT_LAB = (r"(?:(?:informations?|infos?|coordonn[ée]es|nom|adresse|identit[ée]|votre|notre)\s*(?:du\s*|de\s*la\s*|d['’]\s*|de\s*l['’]\s*)?)?"
+              r"client(?:\s*\(\s*e\s*\)|e|s|·e|\.e)?(?![a-zà-ÿ])")
 ETIQ = {"vente": r"(?:factur[ée]e?\s*[àa]|adresse\s*de\s*facturation|[àa]\s*l'attention\s*de|[àa]\s*destination\s*de|"
-                 r"destinataire|client|customer|bill(?:ed)?\s*to|sold\s*to|adress[ée]e?\s*[àa]|nom\s*du\s*client)",
+                 r"destinataire|" + CLIENT_LAB + r"|customer|bill(?:ed)?\s*to|sold\s*to|adress[ée]e?\s*[àa]|doit|acheteu(?:r|se)|"
+                 r"acqu[ée]reu(?:r|se)|donneur\s*d['’]\s*ordre|ma[îi]tre\s*d['’]\s*ouvrage|patient(?:e)?)",
         "achat": r"(?:fournisseur|[ée]metteur|vendeur|vendu\s*par|prestataire|envoy[ée]e?\s*par|from|seller|supplier)"}
 NON_NOM = (r"^(?:factur\w*|avoir|invoice|devis|date|num[ée]ro|n[°º]|total|page|adresse|adress[ée]\w*|siret|siren|tva|iban|bic|"
            r"t[ée]l|email|e-mail|r[ée]f|code|france|paiement|conditions|mode|ech[ée]ance|objet|d[ée]signation|"
-           r"description|quantit[ée]|prix|montant|bon\s*de|commande|client|destinataire|livr\w*|bill|sold|ship|"
+           r"description|quantit[ée]|prix|montant|bon\s*de|commande|client(?:e|s)?|destinataire|livr\w*|bill|sold|ship|"
+           r"informations?|coordonn[ée]es|acheteu\w*|acqu[ée]reu\w*|donneur|ma[îi]tre\s*d|patient\w*|"
            r"doit|[àa]\s*l'attention|[àa]\s*destination)\b")
 RUE = r"(?:rue|avenue|av|bd|boulevard|chemin|impasse|place|all[ée]e|route|cours|quai|zone|za|zi|lotissement|r[ée]sidence)"
 LABELS_EMETTEUR = (r"\s*(?:envoy[ée]e?\s*par|[ée]mise?\s*par|[ée]tablie?\s*par|[ée]metteur|vendeur|vendu\s*par|"
                    r"fournisseur|prestataire|from|seller|supplier|de\s*la\s*part\s*de)\b")
 LABELS_ACHETEUR = (r"(?:factur[ée]e?\s*[àa]|adress[ée]e?\s*[àa]|adresse\s*de\s*facturation|[àa]\s*l'attention|"
-                   r"[àa]\s*destination|destinataire|client|customer|bill(?:ed)?\s*to|sold\s*to|livr[ée]e?\s*[àa]|"
-                   r"nom\s*du\s*client|ship\s*to)")
+                   r"[àa]\s*destination|destinataire|" + CLIENT_LAB + r"|customer|bill(?:ed)?\s*to|sold\s*to|livr[ée]e?\s*[àa]|"
+                   r"ship\s*to|doit|acheteu(?:r|se)|acqu[ée]reu(?:r|se)|donneur\s*d['’]\s*ordre|ma[îi]tre\s*d['’]\s*ouvrage)")
 LEGAL = (r"siret|siren|\brcs\b|capital|n[°º]\s*(?:de\s*)?tva|tva\s*intra\w*|identifiant\s*tva|\bape\b|\bnaf\b|"
          r"immatricul\w*\s+(?:au|sous|[àa]|aupr[èe]s)\b|vat\s*(?:id|no|number)")      # immatriculée au RCS (pas la plaque)
 VEHICULE_MOTS = (r"immatricul|plaque|v[ée]hicule|marque|mod[èe]le|kilom|\bkm\b|ch[âa]ssis|\bvin\b|carte\s*grise|"
@@ -906,6 +911,11 @@ TITRE_LIANTS = {"de", "du", "des", "la", "le", "les", "d", "l", "n", "no", "nr",
                 "service", "services", "prestation", "prestations", "travaux", "frais", "a", "au", "aux", "en", "sur", "pour",
                 "periode", "ref", "reference", "date"}
 
+MOTS_LIBELLE = {"client", "cliente", "clients", "clientes", "e", "informations", "information", "infos", "info", "coordonnees",
+                "nom", "adresse", "du", "de", "la", "le", "l", "d", "votre", "vos", "notre", "destinataire", "facturation",
+                "livraison", "acheteur", "acheteuse", "identite", "doit", "a", "facture", "factures", "adressee", "adresse",
+                "attention", "destination", "particulier", "professionnel", "societe", "contact", "patient", "patiente"}
+
 def _est_titre(s):
     """Vrai si le texte n'est qu'un titre de document (Facture, Note d'honoraires, Facture de situation n°2...)."""
     jetons = [t for t in norm(s).split() if not re.fullmatch(r"n?[\d%.,/\-]+\w{0,2}", t)]   # "n°2" -> "n2" est un numéro
@@ -916,6 +926,7 @@ def _nom_valide(s):
     if len(re.findall(r"[A-Za-zÀ-ÿ]", s)) < 3 or "@" in s or re.search(r"\d{8,}", s.replace(" ", "")): return False
     if _est_titre(s) or re.match(NON_NOM, s, re.I) or re.match(r"^\d{5}\b", s): return False
     if norm(s) and all(t in FORMES or t in FORMES_DEBUT for t in norm(s).split()): return False   # « SAS » seul
+    if norm(s) and all(t in MOTS_LIBELLE for t in norm(s).split()): return False     # « Cliente », « Informations client »
     if re.search(VEHICULE_MOTS, s, re.I) or re.search(r"\b[A-Z]{2}[-\s]?\d{3}[-\s]?[A-Z]{2}\b", s): return False   # véhicule / plaque
     if re.match(LABELS_EMETTEUR + r"\s*:?\s*$", s, re.I) or re.match(rf"\s*{LABELS_ACHETEUR}\s*:?\s*$", s, re.I): return False
     if re.match(r"(?:capital|rcs|r\.c\.s|code\s*naf|naf|ape|n[°º]\s*tva|tva\s*intra|siret|siren|iban|bic)\b", s, re.I): return False
@@ -926,6 +937,10 @@ def _nom_valide(s):
     return True
 
 def _nettoyer_nom(s):
+    s = re.sub(rf"^\s*(?:{CLIENT_LAB}|doit\b|destinataire\b)\s*[:\-–]?\s*(?=\S)", "", str(s), count=1, flags=re.I)
+    return _nettoyer_nom0(s)
+
+def _nettoyer_nom0(s):
     s = s.strip(" :-|")
     if _est_titre(s): return ""                                   # le titre du document n'est pas un tiers
     s = re.sub(r"^(?:facture|avoir|invoice)\s+", "", s, flags=re.I)   # "Facture Dupont SARL" (titre collé au nom)
@@ -1026,7 +1041,7 @@ def _nom_du_bloc(bloc, preuves):
     saute = False                    # True : on est dans le bloc nom + adresse de l'émetteur
     for l in bloc[:14]:
         if re.match(LABELS_EMETTEUR, l, re.I): saute = True; continue
-        m = re.match(rf"\s*{ETIQ['vente']}\b\s*:?\s*(.*)$", l, re.I)
+        m = re.match(rf"\s*{ETIQ['vente']}(?![a-zà-ÿ0-9])\s*:?\s*(.*)$", l, re.I)
         if m: saute = False
         cand = m.group(1) if m else l
         if not m and (":" in cand or re.search(r"\d+[.,]\d{2}\b", cand)): continue        # « Libellé : valeur », montants
@@ -1066,7 +1081,7 @@ def _tiers_texte(lignes, type_, blocs=None):
     em = preuves["noms"][0] if preuves["noms"] else ""
     pas_emetteur = (lambda c: not _est_emetteur(c, preuves)) if type_ == "vente" else (lambda c: True)
     for i, l in enumerate(lignes):                                  # 1. libellé explicite
-        m = re.match(rf"\s*{ETIQ[type_]}\b\s*:?\s*(.*)$", l, re.I)
+        m = re.match(rf"\s*{ETIQ[type_]}(?![a-zà-ÿ0-9])\s*:?\s*(.*)$", l, re.I)
         if not m: continue
         for cand in [m.group(1)] + lignes[i + 1:i + 5]:
             c = _nettoyer_nom(cand)
