@@ -12,7 +12,7 @@ PDF/images : Factur-X (XML intégré) -> texte du PDF (règles) -> OCR PaddleOCR
 -> IA Claude (facultatif, payant, si ANTHROPIC_API_KEY est défini).
 """
 import argparse, hashlib, io, json, os, re, shutil, sys, tempfile, unicodedata, zipfile
-VERSION = "2026.11.06-s"
+VERSION = "2026.11.06-t"
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from decimal import Decimal, ROUND_HALF_UP
@@ -778,11 +778,15 @@ NON_NOM = (r"^(?:factur\w*|avoir|invoice|devis|date|num[ée]ro|n[°º]|total|pag
            r"description|quantit[ée]|prix|montant|bon\s*de|commande|client|destinataire|livr\w*|bill|sold|ship|"
            r"doit|[àa]\s*l'attention|[àa]\s*destination)\b")
 RUE = r"(?:rue|avenue|av|bd|boulevard|chemin|impasse|place|all[ée]e|route|cours|quai|zone|za|zi|lotissement|r[ée]sidence)"
+LABELS_EMETTEUR = (r"\s*(?:envoy[ée]e?\s*par|[ée]mise?\s*par|[ée]tablie?\s*par|[ée]metteur|vendeur|vendu\s*par|"
+                   r"fournisseur|prestataire|from|seller|supplier|de\s*la\s*part\s*de)\b")
 LABELS_ACHETEUR = (r"(?:factur[ée]e?\s*[àa]|adress[ée]e?\s*[àa]|adresse\s*de\s*facturation|[àa]\s*l'attention|"
                    r"[àa]\s*destination|destinataire|client|customer|bill(?:ed)?\s*to|sold\s*to|livr[ée]e?\s*[àa]|"
                    r"nom\s*du\s*client|ship\s*to)")
 LEGAL = (r"siret|siren|\brcs\b|capital|n[°º]\s*(?:de\s*)?tva|tva\s*intra\w*|identifiant\s*tva|\bape\b|\bnaf\b|"
-         r"immatricul|vat\s*(?:id|no|number)")
+         r"immatricul\w*\s+(?:au|sous|[àa]|aupr[èe]s)\b|vat\s*(?:id|no|number)")      # immatriculée au RCS (pas la plaque)
+VEHICULE_MOTS = (r"immatricul|plaque|v[ée]hicule|marque|mod[èe]le|kilom|\bkm\b|ch[âa]ssis|\bvin\b|carte\s*grise|"
+                 r"mise\s*en\s*circulation|\bmec\b|type\s*mine|motorisation|\bcv\b")
 SEP_LEGAL = (r"\s*[|·•]\s*|\s+[-–—]\s+|,\s|\s+(?:au\s+)?capital|\s+siret|\s+siren|\s+rcs|\s+n[°º]|\s+tva|\s+ape\b|"
              r"\s+naf\b|\s+immatricul|\s+soci[ée]t[ée]\s+[àa]")
 
@@ -805,6 +809,8 @@ def _nom_valide(s):
     if len(re.findall(r"[A-Za-zÀ-ÿ]", s)) < 3 or "@" in s or re.search(r"\d{8,}", s.replace(" ", "")): return False
     if _est_titre(s) or re.match(NON_NOM, s, re.I) or re.match(r"^\d{5}\b", s): return False
     if norm(s) and all(t in FORMES or t in FORMES_DEBUT for t in norm(s).split()): return False   # « SAS » seul
+    if re.search(VEHICULE_MOTS, s, re.I) or re.search(r"\b[A-Z]{2}[-\s]?\d{3}[-\s]?[A-Z]{2}\b", s): return False   # véhicule / plaque
+    if re.match(LABELS_EMETTEUR + r"\s*:?\s*$", s, re.I) or re.match(rf"\s*{LABELS_ACHETEUR}\s*:?\s*$", s, re.I): return False
     if re.match(r"(?:capital|rcs|r\.c\.s|code\s*naf|naf|ape|n[°º]\s*tva|tva\s*intra|siret|siren|iban|bic)\b", s, re.I): return False
     if re.match(r"^n[°º]|^no\.?\s*\d", s, re.I): return False                         # "N° FA-2026-12" n'est pas un nom
     if s.count("/") >= 2 or re.fullmatch(r"[A-ZÀ-Ý ]+(?:\s*[/,&-]\s*[A-ZÀ-Ý ]+){2,}", s): return False   # « MAÇONNERIE / CARRELAGE / ISOLATION »
@@ -849,7 +855,17 @@ def _preuves_emetteur(lignes):
     noms, domaines = [], set()
     em = _emetteur_legal(lignes)
     if em: noms.append(em)
+    generiques = {"gmail", "hotmail", "yahoo", "orange", "free", "wanadoo", "outlook", "laposte", "sfr", "icloud", "live",
+                  "aol", "neuf", "bbox", "protonmail", "gmx"}
     for i, l in enumerate(lignes):
+        m = re.match(LABELS_EMETTEUR + r"\s*:?\s*(.*)$", l, re.I)
+        if m:                                                   # « Envoyée par » : le nom qui suit est l'émetteur
+            for cand in [m.group(1)] + lignes[i + 1:i + 3]:
+                c = _nettoyer_nom(cand)
+                if c and _nom_valide(c): noms.append(c); break
+        for loc, dom in re.findall(r"([a-z0-9._\-]+)@([a-z0-9\-]+)\.", l, re.I):
+            if dom.lower() in generiques and len(re.sub(r"[^a-z0-9]", "", loc.lower())) >= 6 and i < 25:
+                domaines.add(re.sub(r"[^a-z0-9]", "", loc.lower()))   # mgdepannageauto@gmail.com -> mgdepannageauto
         legal = re.search(LEGAL + r"|\biban\b|\bbic\b", l, re.I) and not re.match(rf"\s*{LABELS_ACHETEUR}\b", l, re.I)
         for d in re.findall(r"www\.([a-z0-9\-]+)\.", l, re.I): domaines.add(d.replace("-", "").lower())
         if legal:
@@ -859,7 +875,7 @@ def _preuves_emetteur(lignes):
         if m:
             c = _nettoyer_nom(m.group(1))
             if c and _nom_valide(c): noms.append(c)
-    domaines -= {"gmail", "hotmail", "yahoo", "orange", "free", "wanadoo", "outlook", "laposte", "sfr", "icloud", "live", "aol", "neuf", "bbox"}
+    domaines -= generiques
     return {"noms": noms, "domaines": {d for d in domaines if len(d) >= 4}}
 
 def _est_emetteur(c, preuves):
@@ -898,13 +914,28 @@ def _blocs_haut(fichier, max_pages=10):
     return out
 
 def _nom_du_bloc(bloc, preuves):
-    """1er nom plausible d'un bloc d'adresse (après un éventuel libellé « Client : »), hors émetteur."""
-    for l in bloc[:10]:
+    """1er nom plausible d'un bloc d'adresse, hors émetteur : le nom de l'émetteur et son adresse sont passés
+    (jusqu'au code postal / téléphone / e-mail), puis le nom suivant est retenu ; « Client : X » est pris directement."""
+    saute = False                    # True : on est dans le bloc nom + adresse de l'émetteur
+    for l in bloc[:14]:
+        if re.match(LABELS_EMETTEUR, l, re.I): saute = True; continue
         m = re.match(rf"\s*{ETIQ['vente']}\b\s*:?\s*(.*)$", l, re.I)
+        if m: saute = False
         cand = m.group(1) if m else l
+        if not m and (":" in cand or re.search(r"\d+[.,]\d{2}\b", cand)): continue        # « Libellé : valeur », montants
+        contact = re.search(r"\b\d{5}\b|@|www\.|t[ée]l|port\.|fax|\+33|\b0\d(?:[ .]?\d{2}){4}\b", cand, re.I)
+        if saute:
+            if contact: saute = "fin"                      # adresse de l'émetteur terminée...
+            elif saute == "fin":
+                saute = False                              # ...la ligne suivante peut être le client
+            else:
+                continue
+            if saute: continue
+        if contact: continue
         c = _nettoyer_nom(cand)
-        if c and _nom_valide(c) and not re.search(r"\d{5}|@|www\.|t[ée]l|port\.|fax", c, re.I):
-            return "" if _est_emetteur(c, preuves) else c
+        if c and _nom_valide(c):
+            if _est_emetteur(c, preuves): saute = True; continue
+            return c
     return ""
 
 def _client_par_position(blocs, preuves, lignes):
@@ -915,12 +946,12 @@ def _client_par_position(blocs, preuves, lignes):
         return any(_est_emetteur(_nettoyer_nom(x), preuves) or re.search(LEGAL, x, re.I) for x in b[:10])
     premier = next((_nettoyer_nom(l) for l in lignes[:3] if _nettoyer_nom(l) and _nom_valide(_nettoyer_nom(l))), "")
     ordre = [d, g]
-    if emetteur_dans(d) and not emetteur_dans(g): ordre = [g]
-    elif emetteur_dans(g) and not emetteur_dans(d): ordre = [d]
+    if emetteur_dans(d) and not emetteur_dans(g): ordre = [g, d]          # client de l'autre côté, sinon sous l'émetteur
+    elif emetteur_dans(g) and not emetteur_dans(d): ordre = [d, g]
     elif premier and any(_meme_societe(premier, _nettoyer_nom(x)) for x in d[:3]): ordre = [g]   # en-tête à droite
     for b in ordre:
         c = _nom_du_bloc(b, preuves)
-        if c and not (premier and _meme_societe(c, premier) and b is not ordre[0]): return c
+        if c and not (premier and _meme_societe(c, premier)): return c
     return ""
 
 def _tiers_texte(lignes, type_, blocs=None):
